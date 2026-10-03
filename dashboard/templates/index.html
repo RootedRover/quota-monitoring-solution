@@ -1,0 +1,387 @@
+{% extends "base.html" %}
+
+{% macro badge(ratio) -%}
+  {%- set sev = severity(ratio) -%}
+  <span class="inline-block px-2 py-0.5 rounded text-xs font-medium
+    {% if sev == 'critical' %}bg-red-100 text-red-800
+    {% elif sev == 'warning' %}bg-orange-100 text-orange-800
+    {% elif sev == 'elevated' %}bg-yellow-100 text-yellow-800
+    {% elif sev == 'ok' %}bg-green-100 text-green-800
+    {% else %}bg-gray-100 text-gray-600{% endif %}">
+    {{ ratio | pct }}
+  </span>
+{%- endmacro %}
+
+{% block content %}
+
+<!-- ------------------------------------------------------------- summary -->
+<div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-5">
+  {% set cards = [
+      ('Quotas tracked', summary.get('tracked', 0), 'text-gray-900'),
+      ('Critical (>=90%)', summary.get('critical', 0), 'text-red-700'),
+      ('Warning (80-90%)', summary.get('warning', 0), 'text-orange-600'),
+      ('Projects', summary.get('projects', 0), 'text-gray-900'),
+      ('Services', summary.get('services', 0), 'text-gray-900'),
+      ('Not comparable', summary.get('excluded', 0), 'text-gray-500'),
+  ] %}
+  {% for label, value, colour in cards %}
+    <div class="bg-white border border-gray-200 rounded p-3">
+      <div class="text-xs text-gray-500">{{ label }}</div>
+      <div class="text-2xl font-semibold {{ colour }}">{{ value }}</div>
+    </div>
+  {% endfor %}
+</div>
+
+<!-- ---------------------------------------------------------------- tabs -->
+<div class="border-b border-gray-200 mb-4">
+  <nav class="flex gap-6 text-sm">
+    {% for key, label in [
+        ('risk', 'Risk'), ('movers', 'Movers'),
+        ('hierarchy', 'Hierarchy'), ('quality', 'Data quality')] %}
+      <button data-tab="{{ key }}" onclick="showTab('{{ key }}')"
+              class="tab-button pb-2 border-b-2 border-transparent text-gray-500
+                     hover:text-gray-900">{{ label }}</button>
+    {% endfor %}
+  </nav>
+</div>
+
+<!-- ---------------------------------------------------------------- risk -->
+<section id="tab-risk" class="tab-panel">
+  <div class="flex items-center gap-3 mb-3">
+    <input id="filter" type="search" placeholder="Filter by project, service, metric or limit…"
+           oninput="filterTable()"
+           class="w-96 px-3 py-1.5 border border-gray-300 rounded text-sm">
+    <form method="get" class="flex items-center gap-2 text-xs text-gray-600">
+      <label for="min_ratio">min 30d peak</label>
+      <select id="min_ratio" name="min_ratio" onchange="this.form.submit()"
+              class="border border-gray-300 rounded px-2 py-1">
+        {% for value, label in [(0.0,'any'),(0.5,'50%'),(0.8,'80%'),(0.9,'90%')] %}
+          <option value="{{ value }}" {% if min_ratio == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <span class="text-xs text-gray-500 ml-auto" id="row-count">{{ risk | length }} quotas</span>
+  </div>
+
+  <div class="bg-white border border-gray-200 rounded overflow-auto" style="max-height:70vh">
+    <table class="w-full text-xs sticky-head">
+      <thead class="bg-gray-100 text-gray-600 text-left">
+        <tr>
+          <th class="px-3 py-2 font-medium">Project</th>
+          <th class="px-3 py-2 font-medium">Service</th>
+          <th class="px-3 py-2 font-medium">Quota metric</th>
+          <th class="px-3 py-2 font-medium">Limit</th>
+          <th class="px-3 py-2 font-medium">Location</th>
+          <th class="px-3 py-2 font-medium text-right">Peak 7d</th>
+          <th class="px-3 py-2 font-medium text-right">Peak 30d</th>
+          <th class="px-3 py-2 font-medium text-right">Peak usage</th>
+          <th class="px-3 py-2 font-medium text-right">Limit value</th>
+          <th class="px-3 py-2 font-medium text-right">Headroom</th>
+        </tr>
+      </thead>
+      <tbody id="risk-body" class="divide-y divide-gray-100">
+        {% for row in risk %}
+          <tr class="row-link"
+              data-search="{{ (row.project_id ~ ' ' ~ row.service ~ ' ' ~ row.quota_metric ~ ' ' ~ (row.limit_name or '')) | lower }}"
+              onclick="openDrawer(this)"
+              data-project="{{ row.project_id }}"
+              data-service="{{ row.service }}"
+              data-metric="{{ row.quota_metric }}"
+              data-limit="{{ row.limit_name or '' }}"
+              data-location="{{ row.location }}">
+            <td class="px-3 py-1.5 whitespace-nowrap">{{ row.project_id }}</td>
+            <td class="px-3 py-1.5 whitespace-nowrap text-gray-600">
+              {{ row.service.split('.')[0] }}</td>
+            <td class="px-3 py-1.5">{{ row.quota_metric }}</td>
+            <td class="px-3 py-1.5 text-gray-600">{{ row.limit_name or '—' }}</td>
+            <td class="px-3 py-1.5 text-gray-500">{{ row.location }}</td>
+            <td class="px-3 py-1.5 text-right">{{ badge(row.peak_ratio_7d) }}</td>
+            <td class="px-3 py-1.5 text-right">{{ badge(row.peak_ratio_30d) }}</td>
+            <td class="px-3 py-1.5 text-right tabular-nums">{{ row.peak_usage_30d | num }}</td>
+            <td class="px-3 py-1.5 text-right tabular-nums">
+              {% if row.is_unlimited %}
+                <span class="text-gray-400">unlimited</span>
+              {% else %}{{ row.limit_value | num }}{% endif %}
+            </td>
+            <td class="px-3 py-1.5 text-right tabular-nums text-gray-600">
+              {% if row.is_unlimited %}—{% else %}{{ row.headroom_30d | num }}{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if not risk %}
+      <p class="p-6 text-center text-gray-500">
+        No comparable quotas yet. Run a collection first.</p>
+    {% endif %}
+  </div>
+</section>
+
+<!-- -------------------------------------------------------------- movers -->
+<section id="tab-movers" class="tab-panel hidden">
+  <p class="text-xs text-gray-500 mb-3">
+    Quotas whose last 7 days are materially busier than the preceding three
+    weeks. Rows below a 5% peak are excluded: a jump from 0.01% to 0.02% is a
+    doubling and means nothing.
+  </p>
+  <div class="bg-white border border-gray-200 rounded overflow-auto">
+    <table class="w-full text-xs">
+      <thead class="bg-gray-100 text-gray-600 text-left">
+        <tr>
+          <th class="px-3 py-2 font-medium">Project</th>
+          <th class="px-3 py-2 font-medium">Quota metric</th>
+          <th class="px-3 py-2 font-medium">Limit</th>
+          <th class="px-3 py-2 font-medium text-right">Baseline</th>
+          <th class="px-3 py-2 font-medium text-right">Last 7d</th>
+          <th class="px-3 py-2 font-medium text-right">Change</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        {% for row in movers %}
+          <tr>
+            <td class="px-3 py-1.5">{{ row.project_id }}</td>
+            <td class="px-3 py-1.5">{{ row.quota_metric }}</td>
+            <td class="px-3 py-1.5 text-gray-600">{{ row.limit_name or '—' }}</td>
+            <td class="px-3 py-1.5 text-right">{{ row.baseline | pct }}</td>
+            <td class="px-3 py-1.5 text-right">{{ badge(row.recent) }}</td>
+            <td class="px-3 py-1.5 text-right font-medium
+                {% if row.delta > 0 %}text-red-700{% else %}text-green-700{% endif %}">
+              {{ '%+.1f' % (row.delta * 100) }} pp
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if not movers %}
+      <p class="p-6 text-center text-gray-500">
+        Nothing moved materially. Needs at least 28 days of history.</p>
+    {% endif %}
+  </div>
+</section>
+
+<!-- ----------------------------------------------------------- hierarchy -->
+<section id="tab-hierarchy" class="tab-panel hidden">
+  <p class="text-xs text-gray-500 mb-3">
+    Counts rather than averages: the mean of a set of quota ratios is not a
+    meaningful quantity, but the number of quotas above a threshold is.
+  </p>
+  <div class="bg-white border border-gray-200 rounded overflow-auto">
+    <table class="w-full text-xs">
+      <thead class="bg-gray-100 text-gray-600 text-left">
+        <tr>
+          <th class="px-3 py-2 font-medium">Organisation</th>
+          <th class="px-3 py-2 font-medium">Folder</th>
+          <th class="px-3 py-2 font-medium">Project</th>
+          <th class="px-3 py-2 font-medium text-right">Tracked</th>
+          <th class="px-3 py-2 font-medium text-right">Critical</th>
+          <th class="px-3 py-2 font-medium text-right">Warning</th>
+          <th class="px-3 py-2 font-medium text-right">Worst 30d</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        {% for row in hierarchy %}
+          <tr>
+            <td class="px-3 py-1.5 text-gray-600">{{ row.org_id or '—' }}</td>
+            <td class="px-3 py-1.5 text-gray-600">{{ row.folder_id or '—' }}</td>
+            <td class="px-3 py-1.5">{{ row.project_id }}</td>
+            <td class="px-3 py-1.5 text-right tabular-nums">{{ row.quotas_tracked }}</td>
+            <td class="px-3 py-1.5 text-right tabular-nums
+                {% if row.critical_30d %}text-red-700 font-medium{% endif %}">
+              {{ row.critical_30d }}</td>
+            <td class="px-3 py-1.5 text-right tabular-nums
+                {% if row.warning_30d %}text-orange-600 font-medium{% endif %}">
+              {{ row.warning_30d }}</td>
+            <td class="px-3 py-1.5 text-right">{{ badge(row.worst_30d) }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------- quality -->
+<section id="tab-quality" class="tab-panel hidden">
+  <p class="text-xs text-gray-500 mb-3">
+    Why rows are or are not charted. A dashboard that silently drops part of
+    its input is worse than one that shows you what it dropped — this panel is
+    the reason the other three can be trusted.
+  </p>
+  <div class="grid md:grid-cols-2 gap-4">
+    <div class="bg-white border border-gray-200 rounded overflow-hidden">
+      <table class="w-full text-xs">
+        <thead class="bg-gray-100 text-gray-600 text-left">
+          <tr>
+            <th class="px-3 py-2 font-medium">Flag</th>
+            <th class="px-3 py-2 font-medium text-right">Rows</th>
+            <th class="px-3 py-2 font-medium text-right">Quotas</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-100">
+          {% for row in quality %}
+            <tr class="row-link" onclick="loadQuality('{{ row.flag }}')">
+              <td class="px-3 py-1.5 font-mono">{{ row.flag }}</td>
+              <td class="px-3 py-1.5 text-right tabular-nums">{{ row.row_count }}</td>
+              <td class="px-3 py-1.5 text-right tabular-nums">{{ row.quota_count }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="bg-white border border-gray-200 rounded p-3">
+      <h3 class="font-medium mb-2" id="quality-title">Select a flag</h3>
+      <div id="quality-detail" class="text-xs text-gray-600 overflow-auto"
+           style="max-height:50vh"></div>
+    </div>
+  </div>
+</section>
+
+<!-- -------------------------------------------------------------- drawer -->
+<div id="drawer"
+     class="drawer hidden-right fixed top-0 right-0 h-full w-full max-w-2xl bg-white
+            border-l border-gray-300 shadow-xl z-50 overflow-auto">
+  <div class="p-5">
+    <div class="flex items-start">
+      <div>
+        <h2 id="drawer-title" class="text-base font-semibold"></h2>
+        <p id="drawer-subtitle" class="text-xs text-gray-500 mt-1"></p>
+      </div>
+      <button onclick="closeDrawer()"
+              class="ml-auto text-gray-400 hover:text-gray-900 text-xl leading-none">&times;</button>
+    </div>
+    <div class="mt-5" style="height:260px"><canvas id="drawer-chart"></canvas></div>
+    <div id="drawer-table" class="mt-5"></div>
+  </div>
+</div>
+<div id="scrim" onclick="closeDrawer()"
+     class="fixed inset-0 bg-black/20 z-40 hidden"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // ------------------------------------------------------------------ tabs
+  function showTab(name) {
+    document.querySelectorAll('.tab-panel').forEach(el => el.classList.add('hidden'));
+    document.getElementById('tab-' + name).classList.remove('hidden');
+    document.querySelectorAll('.tab-button').forEach(el => {
+      const active = el.dataset.tab === name;
+      el.classList.toggle('border-blue-600', active);
+      el.classList.toggle('text-gray-900', active);
+      el.classList.toggle('font-medium', active);
+      el.classList.toggle('text-gray-500', !active);
+      el.classList.toggle('border-transparent', !active);
+    });
+    location.hash = name;
+  }
+
+  // ---------------------------------------------------------------- filter
+  function filterTable() {
+    const needle = document.getElementById('filter').value.toLowerCase();
+    let shown = 0;
+    document.querySelectorAll('#risk-body tr').forEach(tr => {
+      const hit = !needle || tr.dataset.search.includes(needle);
+      tr.classList.toggle('hidden', !hit);
+      if (hit) shown++;
+    });
+    document.getElementById('row-count').textContent = shown + ' quotas';
+  }
+
+  // ---------------------------------------------------------------- drawer
+  let chart = null;
+
+  async function openDrawer(tr) {
+    const q = new URLSearchParams({
+      project_id: tr.dataset.project,
+      service:    tr.dataset.service,
+      quota_metric: tr.dataset.metric,
+      limit_name: tr.dataset.limit,
+      location:   tr.dataset.location,
+    });
+    document.getElementById('drawer-title').textContent = tr.dataset.metric;
+    document.getElementById('drawer-subtitle').textContent =
+      `${tr.dataset.project} · ${tr.dataset.limit || 'no limit name'} · ${tr.dataset.location}`;
+    document.getElementById('drawer').classList.remove('hidden-right');
+    document.getElementById('scrim').classList.remove('hidden');
+
+    const res = await fetch('/api/history?' + q);
+    const { series } = await res.json();
+
+    const labels = series.map(p => p.usage_date_utc);
+    const peak   = series.map(p => p.peak_ratio === null ? null : p.peak_ratio * 100);
+
+    if (chart) chart.destroy();
+    chart = new Chart(document.getElementById('drawer-chart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Daily peak consumption (%)',
+          data: peak,
+          borderColor: '#1a73e8',
+          backgroundColor: 'rgba(26,115,232,0.1)',
+          fill: true,
+          tension: 0.2,
+          spanGaps: true,
+          pointRadius: 2,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          // Not pinned to 100: clipping the axis would hide exactly the
+          // pathological values this rewrite exists to surface.
+          y: { beginAtZero: true, ticks: { callback: v => v + '%' } }
+        },
+        plugins: { legend: { display: false } }
+      }
+    });
+
+    const rows = series.slice().reverse().slice(0, 15).map(p => `
+      <tr class="border-t border-gray-100">
+        <td class="py-1 pr-3">${p.usage_date_utc}</td>
+        <td class="py-1 pr-3 text-right tabular-nums">${p.daily_peak_usage ?? '—'}</td>
+        <td class="py-1 pr-3 text-right tabular-nums">${p.limit_value ?? '—'}</td>
+        <td class="py-1 pr-3 text-right">${p.peak_ratio === null ? '—' : (p.peak_ratio*100).toFixed(2) + '%'}</td>
+        <td class="py-1 text-gray-500">${(p.flags || []).join(', ')}</td>
+      </tr>`).join('');
+    document.getElementById('drawer-table').innerHTML = `
+      <table class="w-full text-xs">
+        <thead class="text-gray-500 text-left">
+          <tr><th class="pb-1">Date</th><th class="pb-1 text-right">Peak usage</th>
+              <th class="pb-1 text-right">Limit</th><th class="pb-1 text-right">Ratio</th>
+              <th class="pb-1">Flags</th></tr>
+        </thead><tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function closeDrawer() {
+    document.getElementById('drawer').classList.add('hidden-right');
+    document.getElementById('scrim').classList.add('hidden');
+  }
+
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
+  // --------------------------------------------------------------- quality
+  async function loadQuality(flag) {
+    document.getElementById('quality-title').textContent = flag;
+    const res = await fetch('/api/quality/' + encodeURIComponent(flag));
+    const { rows } = await res.json();
+    document.getElementById('quality-detail').innerHTML = rows.length ? `
+      <table class="w-full">
+        <thead class="text-gray-500 text-left">
+          <tr><th class="pb-1">Project</th><th class="pb-1">Quota metric</th>
+              <th class="pb-1">Limit</th><th class="pb-1">Scope</th></tr>
+        </thead>
+        <tbody>${rows.map(r => `
+          <tr class="border-t border-gray-100">
+            <td class="py-1 pr-2">${r.project_id}</td>
+            <td class="py-1 pr-2">${r.quota_metric}</td>
+            <td class="py-1 pr-2">${r.limit_name ?? '—'}</td>
+            <td class="py-1">${r.limit_scope}</td>
+          </tr>`).join('')}</tbody>
+      </table>` : '<p class="text-gray-500">No rows.</p>';
+  }
+
+  showTab((location.hash || '#risk').slice(1));
+</script>
+{% endblock %}

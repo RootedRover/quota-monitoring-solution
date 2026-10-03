@@ -47,4 +47,10 @@ extend-select = ["S", "BLE", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 # Bare asserts are the entire point of a test.
 "tests/**" = ["S101"]
+# These two modules build BigQuery view and table references by interpolation
+# because BigQuery cannot bind an identifier as a query parameter. Every part
+# is validated by collector.bqnames first, and all actual *values* in these
+# queries are passed as parameters. S608 cannot tell the difference.
+"collector/sinks/views.py" = ["S608"]
+"dashboard/queries.py" = ["S608"]
 

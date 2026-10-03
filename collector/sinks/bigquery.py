@@ -10,8 +10,10 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from google.cloud import bigquery
 
@@ -20,6 +22,11 @@ from ..model import DailyRollup
 _LOG = logging.getLogger(__name__)
 
 TABLE_ID = "quota_daily"
+
+# BigQuery cannot move a dataset after creation, so this is worth getting right
+# the first time. Co-locating the dataset with the Cloud Run region avoids
+# cross-region reads on every dashboard page load.
+DEFAULT_LOCATION = os.environ.get("QMS_BQ_LOCATION", "US")
 
 # `project.dataset.table`, where each part is restricted to the characters
 # BigQuery actually permits in an identifier.
@@ -59,8 +66,28 @@ SCHEMA = [
 ]
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Where a project sits in the resource hierarchy.
+
+    Kept as a plain record rather than importing ``ProjectNode`` so the sink
+    does not depend on the discovery source; the collector can equally well be
+    handed a placement map from configuration.
+    """
+
+    org_id: str | None
+    folder_id: str | None
+    project_number: str | None
+
+
 class BigQuerySink:
-    def __init__(self, project_id: str, dataset: str, *, location: str = "US") -> None:
+    def __init__(
+        self,
+        project_id: str,
+        dataset: str,
+        *,
+        location: str = DEFAULT_LOCATION,
+    ) -> None:
         self.project_id = project_id
         self.dataset = dataset
         self.location = location
@@ -85,8 +112,17 @@ class BigQuerySink:
         table.clustering_fields = ["project_id", "service", "quota_metric", "limit_name"]
         self._client.create_table(table, exists_ok=True)
 
-    def write(self, rows: Iterable[DailyRollup], *, collected_at: dt.datetime) -> int:
-        payload = [_to_json(row, collected_at) for row in rows]
+    def write(
+        self,
+        rows: Iterable[DailyRollup],
+        *,
+        collected_at: dt.datetime,
+        placements: dict[str, Placement] | None = None,
+    ) -> int:
+        placements = placements or {}
+        payload = [
+            _to_json(row, collected_at, placements.get(row.key.project_id)) for row in rows
+        ]
         if not payload:
             _LOG.warning("no rows to write")
             return 0
@@ -135,16 +171,20 @@ class BigQuerySink:
         return self.table_ref
 
 
-def _to_json(row: DailyRollup, collected_at: dt.datetime) -> dict:
+def _to_json(
+    row: DailyRollup,
+    collected_at: dt.datetime,
+    placement: Placement | None,
+) -> dict:
     return {
         "usage_date_utc": row.usage_date_utc.isoformat(),
         "usage_date_local": row.usage_date_local.isoformat() if row.usage_date_local else None,
         "window_boundary": row.window_boundary,
         "collected_at": collected_at.isoformat(),
-        "org_id": None,
-        "folder_id": None,
+        "org_id": placement.org_id if placement else None,
+        "folder_id": placement.folder_id if placement else None,
         "project_id": row.key.project_id,
-        "project_number": None,
+        "project_number": placement.project_number if placement else None,
         "service": row.key.service,
         "quota_metric": row.key.quota_metric,
         "limit_name": row.key.limit_name or None,

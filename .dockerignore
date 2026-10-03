@@ -1,0 +1,18 @@
+# Keep the build context small and, more importantly, keep local credentials
+# and virtualenvs out of the image entirely.
+.venv/
+**/__pycache__/
+*.pyc
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+tests/
+terraform/
+security/
+img/
+*.md
+!README.md
+.gitignore
+.markdownlint.json
+QMS_app_alerting.csv

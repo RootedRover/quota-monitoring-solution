@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 
 from .model import DailyRollup, QuotaDefinition
 from .rollup import UsageBundle, build_rollups
+from .sinks.bigquery import Placement
 from .sources.cloud_quotas import CloudQuotasSource
 from .sources.hierarchy import HierarchySource
 from .sources.monitoring import MonitoringSource
@@ -98,7 +99,7 @@ def active_services(bundle: UsageBundle) -> set[tuple[str, str]]:
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
-    projects = resolve_projects(args)
+    projects, placements = resolve_projects(args)
     bundle, definitions = gather(
         projects=projects, billing_project=args.billing_project, days=args.days
     )
@@ -112,16 +113,16 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
     from .sinks.bigquery import BigQuerySink
 
-    sink = BigQuerySink(args.billing_project, args.dataset)
+    sink = BigQuerySink(args.billing_project, args.dataset, location=args.bq_location)
     sink.ensure_table()
     sink.delete_days(sorted({row.usage_date_utc for row in rows}))
-    sink.write(rows, collected_at=dt.datetime.now(dt.UTC))
+    sink.write(rows, collected_at=dt.datetime.now(dt.UTC), placements=placements)
     return 0
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """Print the full derivation of each ratio so it can be checked by hand."""
-    projects = resolve_projects(args)
+    projects, _ = resolve_projects(args)
     bundle, definitions = gather(
         projects=projects, billing_project=args.billing_project, days=args.days
     )
@@ -195,15 +196,49 @@ def summarise(rows: list[DailyRollup]) -> None:
         print(f"    {project:<40} {count}")
 
 
-def resolve_projects(args: argparse.Namespace) -> list[str]:
+def cmd_views(args: argparse.Namespace) -> int:
+    """(Re)create the views the dashboard reads.
+
+    Separate from ``collect`` because the two change on different schedules:
+    the data is refreshed daily, the view definitions only when we change the
+    SQL. Running it is cheap and idempotent, so the deploy does it every time.
+    """
+    from google.cloud import bigquery
+
+    from .sinks.views import ensure_views
+
+    client = bigquery.Client(project=args.billing_project, location=args.bq_location)
+    created = ensure_views(client, args.billing_project, args.dataset)
+    for name in created:
+        print(f"  {args.billing_project}.{args.dataset}.{name}")
+    print(f"{len(created)} views ready")
+    return 0
+
+
+def resolve_projects(args: argparse.Namespace) -> tuple[list[str], dict[str, Placement]]:
+    """Return the projects to scan, plus where each one sits in the hierarchy.
+
+    The placement map is what lets the dashboard roll up by folder and org. It
+    is only available when we discovered the projects ourselves; an explicit
+    ``--projects`` list tells us nothing about the tree, and walking it just to
+    label two projects is not worth the API calls.
+    """
     if args.projects:
-        return args.projects
+        return args.projects, {}
     if args.organization:
         hierarchy = HierarchySource(billing_project=args.billing_project)
         nodes = hierarchy.walk(f"organizations/{args.organization}")
         _LOG.info("discovered %d active projects in org %s", len(nodes), args.organization)
-        return [node.project_id for node in nodes]
-    return [args.billing_project]
+        placements = {
+            node.project_id: Placement(
+                org_id=node.org_id,
+                folder_id=node.folder_id,
+                project_number=node.project_number,
+            )
+            for node in nodes
+        }
+        return [node.project_id for node in nodes], placements
+    return [args.billing_project], {}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -216,6 +251,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--organization", default=os.environ.get("QMS_ORG", ""))
     parser.add_argument("--projects", nargs="*", default=None)
     parser.add_argument("--dataset", default=os.environ.get("QMS_DATASET", "quota_monitoring"))
+    parser.add_argument(
+        "--bq-location",
+        default=os.environ.get("QMS_BQ_LOCATION", "US"),
+        help="dataset location; cannot be changed after the dataset is created",
+    )
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("-v", "--verbose", action="store_true")
 
@@ -233,6 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--limit", type=int, default=20)
     verify.add_argument("--filter", default="")
     verify.set_defaults(func=cmd_verify)
+
+    views = sub.add_parser("views", help="create or replace the dashboard's BigQuery views")
+    views.set_defaults(func=cmd_views)
 
     return parser
 

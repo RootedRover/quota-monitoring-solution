@@ -1,0 +1,44 @@
+# Build config for the single QMS image.
+#
+# Uses a dedicated build service account rather than the default Compute
+# Engine one, which is shared with every other workload in the project and
+# would have to be granted Artifact Registry write access to make this work.
+#
+# CLOUD_LOGGING_ONLY is required: a build running as a user-specified service
+# account must not default to the legacy Cloud Build logs bucket, and sending
+# logs to Cloud Logging avoids having to provision and grant a bucket at all.
+#
+# Note the image path is written out in each step rather than hoisted into a
+# substitution. Cloud Build does not expand built-ins such as $PROJECT_ID
+# inside the *default value* of a user substitution, so doing so silently
+# produces a literal "${PROJECT_ID}" in the image name.
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      # Reuse the previous image's layers so routine code changes do not
+      # re-resolve and re-download the whole dependency tree.
+      - --cache-from=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/qms:latest
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/qms:${_TAG}
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/qms:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/qms
+
+substitutions:
+  _REGION: asia-south1
+  _REPO: qms
+  _TAG: v6
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+timeout: 1200s
