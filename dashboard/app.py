@@ -206,10 +206,42 @@ def _extract_alerts(risk_rows: list[dict], threshold: float) -> list[dict]:
     return out
 
 
+def _serialise_risk_row(row: dict) -> dict:
+    """Format a risk row for dynamic client-side table rendering via /api/risk."""
+    r7 = row.get("peak_ratio_7d")
+    r30 = row.get("peak_ratio_30d")
+    is_unlim = bool(row.get("is_unlimited"))
+    adj = row.get("quota_adjuster_enabled")
+    return {
+        "project_id": row.get("project_id", ""),
+        "service": row.get("service", ""),
+        "quota_metric": row.get("quota_metric", ""),
+        "limit_name": row.get("limit_name") or "",
+        "location": row.get("location") or "global",
+        "quota_class": row.get("quota_class") or "RATE",
+        "interval_seconds": row.get("interval_seconds") or 60,
+        "adjuster": ("ENABLED" if adj is True else ("DISABLED" if adj is False else "UNKNOWN")),
+        "is_unlimited": is_unlim,
+        "limit_value": row.get("limit_value"),
+        "limit_fmt": "Unlimited" if is_unlim else _num(row.get("limit_value")),
+        "peak_usage_7d": row.get("peak_usage_7d"),
+        "peak7_fmt": _num(row.get("peak_usage_7d")),
+        "peak_ratio_7d": r7,
+        "pct7_fmt": _pct(r7),
+        "sev7": severity(r7),
+        "peak_ratio_30d": r30,
+        "pct30_fmt": _pct(r30),
+        "sev30": severity(r30),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
     min_ratio: float = Query(0.0, ge=0.0, le=1.0),
+    project_id: str = Query(""),
+    service: str = Query(""),
+    quota_metric: str = Query(""),
     limit: int = Query(500, ge=1, le=2000),
 ) -> HTMLResponse:
     caller = _require_caller(request)
@@ -220,9 +252,17 @@ def index(
         snap = r.snapshot(
             limit=limit,
             min_ratio=min_ratio,
+            project_id=project_id,
+            service=service,
+            quota_metric=quota_metric,
             allowed_projects=authz_ctx.allowed_projects,
         )
-        alerts = _extract_alerts(snap.get("risk", []), alert_threshold)
+        all_user_risk = r.risk(
+            limit=2000,
+            min_ratio=0.0,
+            allowed_projects=authz_ctx.allowed_projects,
+        )
+        alerts = _extract_alerts(all_user_risk, alert_threshold)
         context = {
             **snap,
             "alerts": alerts,
@@ -237,6 +277,7 @@ def index(
         _LOG.exception("dashboard query failed")
         context = {
             "summary": {},
+            "facets": [],
             "risk": [],
             "movers": [],
             "hierarchy": [],
@@ -257,6 +298,37 @@ def index(
             "error": str(exc),
         }
     return templates.TemplateResponse(request, "index.html", context)
+
+
+@app.get("/api/risk")
+def api_risk(
+    request: Request,
+    project_id: str = Query(""),
+    service: str = Query(""),
+    quota_metric: str = Query(""),
+    min_ratio: float = Query(0.0, ge=0.0, le=1.0),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict:
+    """Return filtered comparable quota rows for dynamic table lookup at 100-500+ project scale."""
+    caller = _require_caller(request)
+    r = repo()
+    authz_ctx = _resolve_authz(caller, r)
+    try:
+        rows = r.risk(
+            limit=limit,
+            min_ratio=min_ratio,
+            project_id=project_id,
+            service=service,
+            quota_metric=quota_metric,
+            allowed_projects=authz_ctx.allowed_projects,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    serialised = [_serialise_risk_row(row) for row in rows]
+    return {
+        "count": len(serialised),
+        "rows": serialised,
+    }
 
 
 @app.get("/api/alerts")

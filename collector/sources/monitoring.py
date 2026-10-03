@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 import google.auth
 import google.auth.transport.requests
 import requests
+from requests.adapters import HTTPAdapter
 
 from ..model import UsageKey, UsageSample
 
@@ -33,6 +36,7 @@ _LOG = logging.getLogger(__name__)
 
 _BASE = "https://monitoring.googleapis.com/v1"
 _CONSUMER = 'monitored_resource="consumer_quota"'
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 SERVICERUNTIME = "serviceruntime.googleapis.com"
 
@@ -81,6 +85,14 @@ class RangePoint:
     value: float
 
 
+def _build_pooled_session(pool_size: int = 16) -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 class MonitoringSource:
     """Reads quota usage series for one scoping project."""
 
@@ -90,40 +102,70 @@ class MonitoringSource:
         *,
         session: requests.Session | None = None,
         timeout: int = 120,
+        max_retries: int = 3,
     ) -> None:
         self.project_id = project_id
         self.timeout = timeout
-        self._session = session or requests.Session()
+        self.max_retries = max_retries
+        self._session = session or _build_pooled_session()
         self._credentials, _ = google.auth.default(
             scopes=["https://www.googleapis.com/auth/monitoring.read"]
         )
+        self._lock = threading.Lock()
 
     # -- transport ---------------------------------------------------------
 
     def _token(self) -> str:
-        if not self._credentials.valid:
-            self._credentials.refresh(google.auth.transport.requests.Request())
-        return self._credentials.token
+        with self._lock:
+            if not self._credentials.valid:
+                self._credentials.refresh(google.auth.transport.requests.Request())
+            return self._credentials.token
 
     def _post(self, path: str, data: dict[str, str]) -> dict:
         url = f"{_BASE}/projects/{self.project_id}/location/global/prometheus/api/v1/{path}"
-        response = self._session.post(
-            url,
-            data=data,
-            headers={"Authorization": f"Bearer {self._token()}"},
-            timeout=self.timeout,
-        )
-        try:
-            payload = response.json()
-        except ValueError as exc:  # pragma: no cover - transport failure
-            raise PromQLError(
-                f"non-JSON response ({response.status_code}) from {url}: {response.text[:300]}"
-            ) from exc
-        if payload.get("status") != "success":
-            raise PromQLError(
-                f"{path} failed for {self.project_id}: {payload.get('error', payload)}"
+        delay = 0.5
+        for attempt in range(self.max_retries + 1):
+            response = self._session.post(
+                url,
+                data=data,
+                headers={"Authorization": f"Bearer {self._token()}"},
+                timeout=self.timeout,
             )
-        return payload["data"]
+            status = getattr(response, "status_code", 200)
+            if (
+                isinstance(status, int)
+                and status in _RETRYABLE_STATUS_CODES
+                and attempt < self.max_retries
+            ):
+                _LOG.debug(
+                    "PromQL HTTP %d for %s (attempt %d/%d); backing off %.1fs",
+                    status,
+                    self.project_id,
+                    attempt + 1,
+                    self.max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+            try:
+                payload = response.json()
+            except ValueError as exc:  # pragma: no cover - transport failure
+                raise PromQLError(
+                    f"non-JSON response ({response.status_code}) from {url}: {response.text[:300]}"
+                ) from exc
+            if payload.get("status") != "success":
+                err_text = str(payload.get("error", payload))
+                if (
+                    "429" in err_text or "RESOURCE_EXHAUSTED" in err_text
+                ) and attempt < self.max_retries:
+                    time.sleep(delay)
+                    delay *= 2.0
+                    continue
+                raise PromQLError(f"{path} failed for {self.project_id}: {err_text}")
+            return payload["data"]
+
+        raise PromQLError(f"{path} exhausted retries for {self.project_id}")
 
     # -- queries -----------------------------------------------------------
 

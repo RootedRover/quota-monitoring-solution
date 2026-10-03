@@ -502,17 +502,95 @@
   }
 
   // Pre-index table rows once on load (< 1ms for hundreds of rows).
-  const riskRows = Array.from(document.querySelectorAll('#risk-body tr')).map(tr => ({
-    el: tr,
-    project: tr.dataset.project || '',
-    service: tr.dataset.service || '',
-    serviceShort: tr.dataset.serviceShort || '',
-    metric: tr.dataset.metric || '',
-    limit: tr.dataset.limit || '',
-    location: tr.dataset.location || '',
-    ratio30: parseFloat(tr.dataset.ratio30 || '-1'),
-    search: tr.dataset.search || '',
-  }));
+  const facetCatalog = {{ (facets or []) | tojson }};
+  const totalTrackedQuotas = {{ summary.get('tracked', 0) }};
+
+  function indexDomRow(tr) {
+    return {
+      el: tr,
+      project: tr.dataset.project || '',
+      service: tr.dataset.service || '',
+      serviceShort: tr.dataset.serviceShort || '',
+      metric: tr.dataset.metric || '',
+      limit: tr.dataset.limit || '',
+      location: tr.dataset.location || '',
+      ratio30: parseFloat(tr.dataset.ratio30 || '-1'),
+      search: tr.dataset.search || '',
+    };
+  }
+
+  let riskRows = Array.from(document.querySelectorAll('#risk-body tr')).map(indexDomRow);
+  const initialDomRowCount = riskRows.length;
+  let fetchSeq = 0;
+
+  function escHtml(val) {
+    return String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderPctMeterHtml(ratio, pctFmt, sev) {
+    if (ratio === null || ratio === undefined) {
+      return `<div class="pct-cell"><span class="sev-badge sev-${escHtml(sev || 'unknown')}">&mdash;</span></div>`;
+    }
+    const pctVal = ratio * 100;
+    const barW = Math.max(0, Math.min(100, pctVal)).toFixed(1);
+    return `
+      <div class="pct-cell">
+        <div class="pct-bar-track" aria-hidden="true">
+          <div class="pct-bar-fill" style="width: ${barW}%; background: var(--sev-${escHtml(sev)}-bar);"></div>
+        </div>
+        <span class="sev-badge sev-${escHtml(sev)}">${escHtml(pctFmt)}</span>
+      </div>`;
+  }
+
+  function buildRiskRowElement(row) {
+    const svcShort = shortService(row.service || '');
+    const metricShort = shortMetric(row.quota_metric || '');
+    const r30 = row.peak_ratio_30d !== null && row.peak_ratio_30d !== undefined ? row.peak_ratio_30d : -1;
+    const r7 = row.peak_ratio_7d !== null && row.peak_ratio_7d !== undefined ? row.peak_ratio_7d : -1;
+    const p7 = row.peak_usage_7d !== null && row.peak_usage_7d !== undefined ? row.peak_usage_7d : -1;
+    const limSort = row.is_unlimited ? 999999999999999999 : (row.limit_value !== null && row.limit_value !== undefined ? row.limit_value : -1);
+    const searchStr = `${row.project_id} ${row.service} ${row.quota_metric} ${row.limit_name || ''} ${row.location || ''} ${row.quota_class || ''}`.toLowerCase();
+
+    const tr = document.createElement('tr');
+    tr.className = 'clickable-row';
+    tr.setAttribute('onclick', 'openDrawer(this)');
+    tr.dataset.project = row.project_id || '';
+    tr.dataset.service = row.service || '';
+    tr.dataset.serviceShort = svcShort;
+    tr.dataset.metric = row.quota_metric || '';
+    tr.dataset.limit = row.limit_name || '';
+    tr.dataset.location = row.location || 'global';
+    tr.dataset.qclass = row.quota_class || 'RATE';
+    tr.dataset.interval = String(row.interval_seconds || 60);
+    tr.dataset.adjuster = row.adjuster || 'UNKNOWN';
+    tr.dataset.ratio30 = String(r30);
+    tr.dataset.ratio7 = String(r7);
+    tr.dataset.peak7 = String(p7);
+    tr.dataset.limitval = String(limSort);
+    tr.dataset.search = searchStr;
+
+    const limitCellHtml = row.is_unlimited
+      ? `<span class="loc-chip" style="color: var(--text-muted);">Unlimited</span>`
+      : escHtml(row.limit_fmt);
+
+    tr.innerHTML = `
+      <td class="cell-project mono" data-sort="${escHtml(row.project_id)}">${escHtml(row.project_id)}</td>
+      <td data-sort="${escHtml(row.service)}"><div class="cell-service-main" title="${escHtml(row.service)}">${escHtml(svcShort)}</div></td>
+      <td data-sort="${escHtml(metricShort)}"><div class="cell-metric-main mono" title="${escHtml(row.quota_metric)}">${escHtml(metricShort)}</div></td>
+      <td data-sort="${escHtml(row.location)}"><span class="loc-chip">${escHtml(row.location || 'global')}</span></td>
+      <td data-sort="${escHtml(row.limit_name || '')}"><div class="limit-type-main mono">${escHtml(row.limit_name || '—')}</div></td>
+      <td class="num-col tabular mono" data-sort="${limSort}">${limitCellHtml}</td>
+      <td class="num-col tabular mono" data-sort="${p7}">${escHtml(row.peak7_fmt)}</td>
+      <td class="num-col tabular" data-sort="${r7}">${renderPctMeterHtml(row.peak_ratio_7d, row.pct7_fmt, row.sev7)}</td>
+      <td class="num-col tabular" data-sort="${r30}">${renderPctMeterHtml(row.peak_ratio_30d, row.pct30_fmt, row.sev30)}</td>
+    `;
+    return tr;
+  }
 
   // ------------------------------------------------------------------ Tabs
   function showTab(name) {
@@ -528,7 +606,7 @@
   function jumpToProject(projectId) {
     state.project = projectId;
     showTab('risk');
-    applyFilters();
+    applyFilters(true);
   }
 
   // ------------------------------------------------ Searchable Dropdowns
@@ -558,16 +636,29 @@
   document.addEventListener('click', () => closeAllDropdowns());
 
   function facetOptions(facet) {
-    // Cascading counts: count how many rows match the OTHER active filters.
+    // Cascading counts across the full authorized facet catalog (supports 100-500+ projects
+    // even when the initial DOM table is capped at 500 rows).
     const counts = new Map();
-    for (const r of riskRows) {
-      if (facet !== 'project' && state.project && r.project !== state.project) continue;
-      if (facet !== 'service' && state.service && r.service !== state.service) continue;
-      if (facet !== 'metric' && state.metric && r.metric !== state.metric) continue;
-      if (state.minRatio > 0 && r.ratio30 < state.minRatio) continue;
-      const val = r[facet];
-      if (!val) continue;
-      counts.set(val, (counts.get(val) || 0) + 1);
+    if (facetCatalog && facetCatalog.length > 0) {
+      for (const f of facetCatalog) {
+        if (facet !== 'project' && state.project && f.p !== state.project) continue;
+        if (facet !== 'service' && state.service && f.s !== state.service) continue;
+        if (facet !== 'metric' && state.metric && f.m !== state.metric) continue;
+        if (state.minRatio > 0 && f.r < state.minRatio) continue;
+        const val = facet === 'project' ? f.p : (facet === 'service' ? f.s : f.m);
+        if (!val) continue;
+        counts.set(val, (counts.get(val) || 0) + (f.c || 1));
+      }
+    } else {
+      for (const r of riskRows) {
+        if (facet !== 'project' && state.project && r.project !== state.project) continue;
+        if (facet !== 'service' && state.service && r.service !== state.service) continue;
+        if (facet !== 'metric' && state.metric && r.metric !== state.metric) continue;
+        if (state.minRatio > 0 && r.ratio30 < state.minRatio) continue;
+        const val = r[facet];
+        if (!val) continue;
+        counts.set(val, (counts.get(val) || 0) + 1);
+      }
     }
     return Array.from(counts.entries()).sort((a, b) => {
       const dispA = facet === 'metric' ? shortMetric(a[0]) : a[0];
@@ -618,19 +709,19 @@
   function selectFacet(facet, value) {
     state[facet] = value;
     closeAllDropdowns();
-    applyFilters();
+    applyFilters(true);
   }
 
   function clearFacet(facet, ev) {
     ev.stopPropagation();
     state[facet] = '';
     closeAllDropdowns();
-    applyFilters();
+    applyFilters(true);
   }
 
   function setMinRatio(val) {
     state.minRatio = val;
-    applyFilters();
+    applyFilters(true);
   }
 
   function resetAllFilters() {
@@ -641,7 +732,7 @@
     state.quickSearch = '';
     const qs = document.getElementById('quick-search');
     if (qs) qs.value = '';
-    applyFilters();
+    applyFilters(true);
   }
 
   function updateFilterUI(shownCount) {
@@ -686,17 +777,50 @@
     const resetBtn = document.getElementById('btn-reset-all');
     if (resetBtn) resetBtn.classList.toggle('hidden', !anyActive);
 
+    const denom = Math.max(totalTrackedQuotas, riskRows.length);
     const rowCount = document.getElementById('row-count');
     if (rowCount) {
-      rowCount.innerHTML = `Showing <strong>${shownCount}</strong> of ${riskRows.length} quotas`;
+      rowCount.innerHTML = `Showing <strong>${shownCount}</strong> of ${denom.toLocaleString()} quotas`;
     }
     const noMatches = document.getElementById('risk-no-matches');
-    if (noMatches && riskRows.length > 0) {
+    if (noMatches && (riskRows.length > 0 || totalTrackedQuotas > 0)) {
       noMatches.classList.toggle('hidden', shownCount > 0);
     }
   }
 
-  function applyFilters() {
+  async function fetchServerFilteredRows() {
+    const seq = ++fetchSeq;
+    const params = new URLSearchParams({
+      project_id: state.project || '',
+      service: state.service || '',
+      quota_metric: state.metric || '',
+      min_ratio: String(state.minRatio || 0),
+      limit: '500',
+    });
+    try {
+      const resp = await fetch('/api/risk?' + params.toString());
+      if (!resp.ok || seq !== fetchSeq) return;
+      const data = await resp.json();
+      if (seq !== fetchSeq) return;
+      const tbody = document.getElementById('risk-body');
+      if (!tbody) return;
+      const frag = document.createDocumentFragment();
+      const newRiskRows = [];
+      for (const item of (data.rows || [])) {
+        const tr = buildRiskRowElement(item);
+        frag.appendChild(tr);
+        newRiskRows.push(indexDomRow(tr));
+      }
+      tbody.innerHTML = '';
+      tbody.appendChild(frag);
+      riskRows = newRiskRows;
+      applyDomFiltersOnly();
+    } catch (_err) {
+      applyDomFiltersOnly();
+    }
+  }
+
+  function applyDomFiltersOnly() {
     const qs = document.getElementById('quick-search');
     state.quickSearch = (qs ? qs.value : '').trim().toLowerCase();
 
@@ -713,6 +837,16 @@
       if (hit) shown++;
     }
     updateFilterUI(shown);
+  }
+
+  function applyFilters(facetChanged = false) {
+    // When the user has more tracked quotas across 100-500+ projects than the
+    // initial 500 DOM rows, fetch the matching slice from /api/risk on facet change.
+    if (facetChanged && totalTrackedQuotas > initialDomRowCount) {
+      fetchServerFilteredRows();
+      return;
+    }
+    applyDomFiltersOnly();
   }
 
   // -------------------------------------------------------- Column Sorting

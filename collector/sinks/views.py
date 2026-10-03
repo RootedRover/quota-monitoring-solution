@@ -33,9 +33,11 @@ _GRAIN = "project_id, service, quota_metric, limit_name, location"
 
 def _definitions(table: str) -> dict[str, str]:
     return {
-        # Most recent observation per quota, whatever day that happens to be.
+        # Most recent observation per quota within the active 35-day window.
         # Quota metrics are written sporadically, so "yesterday" is not a
         # reliable filter -- a quota can legitimately have no sample for days.
+        # Bounding by 35 days prunes >90% of partitions over the 400-day table
+        # retention while still covering the full 30-day peak window plus buffer.
         "quota_latest": f"""
 SELECT * EXCEPT(rn)
 FROM (
@@ -46,6 +48,7 @@ FROM (
       ORDER BY usage_date_utc DESC
     ) AS rn
   FROM `{table}`
+  WHERE usage_date_utc >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
 )
 WHERE rn = 1
 """,
@@ -66,6 +69,7 @@ SELECT
   COUNT(*) AS observed_days
 FROM `{table}`
 WHERE is_comparable
+  AND usage_date_utc >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
 GROUP BY {_GRAIN}
 """,
         # The main dashboard table: current state joined to the peaks.
@@ -120,6 +124,7 @@ WITH windowed AS (
            peak_ratio, NULL)) AS baseline
   FROM `{table}`
   WHERE is_comparable
+    AND usage_date_utc >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
   GROUP BY {_GRAIN}
 )
 SELECT

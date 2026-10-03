@@ -34,8 +34,11 @@ Google Cloud enforces [quotas](https://cloud.google.com/docs/quota) on resource 
 
 One container image (`Dockerfile`) powers two serverless Cloud Run workloads in a single host project:
 
-1. **`qms-collector` (Cloud Run Job)**: Triggered daily by **Cloud Scheduler** (`qms-daily-collect`). Walks active projects across the organization (`HierarchySource`), queries Cloud Monitoring PromQL (`MonitoringSource`), fetches authoritative quota definitions and Quota Adjuster settings from the Cloud Quotas API (`CloudQuotasSource`), normalizes daily peaks, and loads rows into BigQuery (`BigQuerySink`) via free batch load jobs.
-2. **`qms-dashboard` (Cloud Run Service)**: Read-only FastAPI service (`min_instance_count = 0`) behind **Direct Cloud Run IAP**. Queries the precomputed BigQuery views concurrently with an in-memory stale-while-revalidate (SWR) cache and filters results per user via Cloud Asset Inventory (`analyzeIamPolicy`) and Cloud Resource Manager v3 (`getIamPolicy`).
+1. **`qms-collector` (Cloud Run Job)**: Triggered daily by **Cloud Scheduler** (`qms-daily-collect`). Walks active projects across the organization (`HierarchySource`), queries Cloud Monitoring PromQL (`MonitoringSource`) concurrently across a bounded worker pool (`QMS_COLLECTOR_WORKERS=8`), fetches authoritative quota definitions and Quota Adjuster settings from the Cloud Quotas API (`CloudQuotasSource`) using a thread-safe token-bucket rate limiter (`14 RPS` / `840 RPM`, staying safely below the host project's `1,200 RPM` `ReadRequestsPerMinute` quota with exponential backoff on `HTTP 429`/`5xx`), normalizes daily peaks, and loads rows into BigQuery (`BigQuerySink`) via free batch load jobs.
+2. **`qms-dashboard` (Cloud Run Service)**: Read-only FastAPI service (`min_instance_count = 0`, `512 MiB` RAM) behind **Direct Cloud Run IAP**:
+   * **Partition-Pruned Precomputed Views**: All six BigQuery views (`quota_latest`, `quota_peaks`, `quota_risk`, `quota_movers`, `quota_hierarchy`, `quota_quality`) enforce `usage_date_utc` partition pruning (`30–35` days) so refreshes scan only active partitions rather than the full 400-day retention window.
+   * **Uncapped Facet Catalog + Bounded Memory (`QMS_RISK_CACHE_LIMIT=15000`)**: Populates the **Project**, **Service**, and **Quota Metric** searchable dropdowns from a complete `(project_id, service, quota_metric)` facet index across all 100–500+ projects while capping DOM rendering at 500 rows and dynamically fetching filtered slices via `GET /api/risk`.
+   * **Single-RPC Org IAM Fast Path + SWR Cache**: Evaluates per-user access in a single `organizations/{org_id}:analyzeIamPolicy` (`expandResources=true, expandGroups=true`) call when Cloud Asset Inventory is available, falling back to bounded concurrent Cloud Resource Manager `getIamPolicy` checks only for fresh unindexed grants or custom roles, backed by Stale-While-Revalidate (SWR) caching.
 
 ---
 
@@ -43,23 +46,23 @@ One container image (`Dockerfile`) powers two serverless Cloud Run workloads in 
 
 ```text
 collector/            # Python package for quota collection, normalization, and BigQuery views
-  sources/            #   monitoring.py (PromQL), cloud_quotas.py, hierarchy.py
-  sinks/              #   bigquery.py (batch load jobs), views.py (6 precomputed SQL views)
+  sources/            #   monitoring.py (PromQL + retry), cloud_quotas.py (14 RPS limiter + retry), hierarchy.py
+  sinks/              #   bigquery.py (batch load jobs), views.py (6 partition-pruned SQL views)
   alerts.py           #   Zero-config threshold evaluation, webhook digest, and PromQL builder
   model.py            #   Immutable domain types and comparability flags
   normalise.py        #   Enforcement interval and unlimited-sentinel normalization
   rollup.py           #   Daily peak/current rollup across UTC and US/Pacific boundaries
-  cli.py              #   CLI entry point: `collect` | `backfill` | `verify` | `views`
+  cli.py              #   Parallel CLI entry point: `collect` | `backfill` | `verify` | `views`
 dashboard/            # Self-hosted FastAPI + Jinja2 Cloud Console UI
-  app.py              #   HTTP routes, health checks, and /api/alerts
-  authz.py            #   IAP ES256 JWT verification and cascading Org/Folder/Project IAM check
-  queries.py          #   Concurrent BigQuery view reader with SWR caching
+  app.py              #   HTTP routes, health checks, /api/risk, and /api/alerts
+  authz.py            #   IAP ES256 JWT verification, 1-RPC Org CAI fast path, and SWR authz cache
+  queries.py          #   Concurrent BigQuery view reader with uncapped facet index & SWR caching
   static/             #   QMS logo and browser tab favicons
   templates/          #   base.html and index.html (Risk, Movers, Hierarchy, Quality, Drawer)
 terraform/            # Terraform >= 1.5 / google provider ~> 8.0
   modules/qms/        #   Reusable QMS module (Cloud Run Job + Service, BigQuery, Scheduler, IAM)
   example/            #   Example root module
-tests/                # Golden-file and unit test suite (pytest)
+tests/                # Golden-file and unit test suite (pytest, 108 tests)
 ```
 
 ---
@@ -160,24 +163,24 @@ QMS v6 is designed to run at minimal operational cost by combining scale-to-zero
 
 ### 6.1 Cost Components
 
-* **Cloud Run Job (`qms-collector`)**: `1 vCPU`, `1 GiB` memory, executed once daily (`30 2 * * *`). Billed only for the seconds the job runs (\~6 minutes/day for 100 projects).
-* **Cloud Run Service (`qms-dashboard`)**: `1 vCPU`, `512 MiB` memory with `min_instance_count = 0` (scales to zero when idle). Client-side filtering/sorting and a 5-minute in-memory cache minimize active CPU time.
+* **Cloud Run Job (`qms-collector`)**: `1 vCPU`, `1 GiB` memory, executed once daily (`30 2 * * *`). Parallel 8-worker execution with `14 RPS` rate limiting keeps wall-clock runtime short (\~1.5 minutes/day for 100 projects).
+* **Cloud Run Service (`qms-dashboard`)**: `1 vCPU`, `512 MiB` memory with `min_instance_count = 0` (scales to zero when idle). Client-side filtering/sorting and a 5-minute Stale-While-Revalidate (SWR) in-memory cache minimize active CPU time.
 * **BigQuery (`quota_monitoring`)**:
   * **Ingestion**: Uses batch load jobs (`load_table_from_json`), which are **$0.00 (free)**.
   * **Storage**: Partitioned by `usage_date_utc` and clustered by `(project_id, service, quota_metric)` with 400-day retention (\~1.4 GB logical storage for 100 projects; partitions older than 90 days automatically drop to Long-Term Storage pricing).
-  * **Queries**: Dashboard reads precomputed views cached in memory for 5 minutes rather than issuing per-click queries.
+  * **Queries**: Views (`quota_latest`, `quota_peaks`, `quota_movers`) prune `quota_daily` to the most recent 30–35 partitions, and the dashboard caches view snapshots in memory for 5 minutes rather than issuing per-click queries.
 * **Cloud Monitoring, Cloud Quotas, Cloud Asset & CRM APIs**: Cloud Quotas, Cloud Asset Inventory, and Cloud Resource Manager API calls are free; Cloud Monitoring API reads (`query_range` on GCP `serviceruntime` quota metrics) include 1,000,000 free API read calls/month per billing account ($0.01 per 1,000 calls thereafter).
 * **Direct Cloud Run IAP, Cloud Scheduler & Artifact Registry**: Direct Cloud Run IAP has no hourly load-balancer fee; Cloud Scheduler is $0.10/month for the single daily cron job; Artifact Registry stores one \~180 MB container image (\~$0.02/month).
 
 ### 6.2 Estimated Monthly Cost & Scaling by Project Count
 
-Because `QuotaInfo` limit definitions are cached per GCP service (`O(distinct services)` rather than `O(projects × services)`) and the dashboard serves cached view snapshots in memory, total cost scales gently as the number of monitored projects grows:
+Because `QuotaInfo` limit definitions are cached per GCP service (`O(distinct services)` rather than `O(projects × services)`), `quota_daily` views are partition-pruned, and the dashboard serves cached view snapshots in memory, total cost scales gently as the number of monitored projects grows:
 
-| Monitored Projects | Daily Collector Runtime | Cloud Run (`qms-collector` + `qms-dashboard`) | BigQuery (Storage + Cached View Queries) | Monitoring API, Scheduler & Artifact Registry | **Estimated Total Monthly Cost (Gross List Price)** |
+| Monitored Projects | Daily Collector Runtime | Cloud Run (`qms-collector` + `qms-dashboard`) | BigQuery (Storage + Pruned View Queries) | Monitoring API, Scheduler & Artifact Registry | **Estimated Total Monthly Cost (Gross List Price)** |
 | --- | --- | ---: | ---: | ---: | ---: |
-| **100 Projects** | \~6 min / day | \~$1.65 – $2.30 | \~$0.35 – $3.20 | \~$0.20 – $0.25 | **\~$2.20 – $5.75 / month** |
-| **500 Projects** | \~25 min / day | \~$2.80 – $3.60 | \~$1.50 – $6.00 | \~$0.50 – $0.65 | **\~$4.80 – $10.25 / month** |
-| **1,000 Projects** | \~45 min / day | \~$4.20 – $5.40 | \~$3.00 – $10.00 | \~$0.90 – $1.10 | **\~$8.10 – $16.50 / month** |
+| **100 Projects** | \~1.5 min / day | \~$1.45 – $2.00 | \~$0.20 – $1.10 | \~$0.20 – $0.25 | **\~$1.85 – $3.35 / month** |
+| **500 Projects** | \~7 min / day | \~$2.10 – $2.80 | \~$0.95 – $2.50 | \~$0.50 – $0.65 | **\~$3.55 – $5.95 / month** |
+| **1,000 Projects** | \~14 min / day | \~$3.00 – $3.90 | \~$1.90 – $4.50 | \~$0.90 – $1.10 | **\~$5.80 – $9.50 / month** |
 
 *(When GCP monthly free tiers for Cloud Run, BigQuery 1 TiB query / 10 GB storage, and Cloud Monitoring 1M API reads are available on the billing account, net cost for a 100-project deployment is typically under **$0.25 / month**.)*
 

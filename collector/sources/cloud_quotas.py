@@ -19,11 +19,15 @@ Why this and not the ``serviceruntime.googleapis.com/quota/limit`` metric:
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
 from collections.abc import Iterator
 
 import google.auth
 import google.auth.transport.requests
 import requests
+from requests.adapters import HTTPAdapter
 
 from ..model import QuotaDefinition
 from ..normalise import classify_quota, infer_scope, parse_refresh_interval
@@ -34,10 +38,27 @@ _BASE = "https://cloudquotas.googleapis.com/v1"
 # QuotaAdjusterSettings lives on v1beta; QuotaInfo lives on v1.
 _BASE_BETA = "https://cloudquotas.googleapis.com/v1beta"
 _PAGE_SIZE = 200
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+# Cloud Quotas enforces ReadRequestsPerMinute = 1,200/min (20 RPS) per billing
+# project. Defaulting to 14 RPS (840 RPM) keeps parallel collection comfortably
+# below the quota ceiling while still achieving ~8x speedup over serial loops.
+DEFAULT_MAX_RPS = float(os.environ.get("QMS_CLOUD_QUOTAS_MAX_RPS", "14.0"))
 
 
 class CloudQuotasError(RuntimeError):
     pass
+
+
+class CloudQuotasTransientError(CloudQuotasError):
+    """Raised when a retryable rate-limit (429) or 5xx error persists after backoff."""
+
+
+def _build_pooled_session(pool_size: int = 16) -> requests.Session:
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 class CloudQuotasSource:
@@ -46,6 +67,8 @@ class CloudQuotasSource:
     The cache key deliberately includes the container because limit *values*
     are per-container, but note that the interval/dimensions/class metadata is
     a property of the quota definition itself and is identical everywhere.
+    Thread-safe and rate-limited so concurrent workers never exceed the host
+    project's ``cloudquotas.googleapis.com/read_requests`` quota (1,200 RPM).
     """
 
     def __init__(
@@ -54,47 +77,104 @@ class CloudQuotasSource:
         billing_project: str,
         session: requests.Session | None = None,
         timeout: int = 60,
+        max_rps: float | None = None,
+        max_retries: int = 4,
     ) -> None:
         self.billing_project = billing_project
         self.timeout = timeout
-        self._session = session or requests.Session()
+        self.max_retries = max_retries
+        resolved_rps = DEFAULT_MAX_RPS if max_rps is None else max_rps
+        self._min_interval = (1.0 / resolved_rps) if resolved_rps > 0 else 0.0
+        self._next_allowed_at = 0.0
+        self._session = session or _build_pooled_session()
         self._credentials, _ = google.auth.default(
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
         self._cache: dict[tuple[str, str], list[QuotaDefinition]] = {}
         self._adjuster_cache: dict[str, bool | None] = {}
+        self._lock = threading.Lock()
 
     def _token(self) -> str:
-        if not self._credentials.valid:
-            self._credentials.refresh(google.auth.transport.requests.Request())
-        return self._credentials.token
+        with self._lock:
+            if not self._credentials.valid:
+                self._credentials.refresh(google.auth.transport.requests.Request())
+            return self._credentials.token
+
+    def _throttle(self) -> None:
+        if self._min_interval <= 0.0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed_at - now
+            if wait > 0:
+                self._next_allowed_at += self._min_interval
+            else:
+                wait = 0.0
+                self._next_allowed_at = now + self._min_interval
+        if wait > 0:
+            time.sleep(wait)
 
     def _get(self, url: str, params: dict[str, str]) -> dict:
-        response = self._session.get(
-            url,
-            params=params,
-            headers={
-                "Authorization": f"Bearer {self._token()}",
-                # Required when running on user ADC, otherwise the call is
-                # rejected for having no billing project attached.
-                "x-goog-user-project": self.billing_project,
-            },
-            timeout=self.timeout,
-        )
-        payload = response.json()
-        if "error" in payload:
-            raise CloudQuotasError(payload["error"].get("message", str(payload["error"])))
-        return payload
+        delay = 0.5
+        for attempt in range(self.max_retries + 1):
+            self._throttle()
+            response = self._session.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {self._token()}",
+                    # Required when running on user ADC, otherwise the call is
+                    # rejected for having no billing project attached.
+                    "x-goog-user-project": self.billing_project,
+                },
+                timeout=self.timeout,
+            )
+            status = getattr(response, "status_code", 200)
+            if isinstance(status, int) and status in _RETRYABLE_STATUS_CODES:
+                if attempt < self.max_retries:
+                    _LOG.debug(
+                        "Cloud Quotas HTTP %d on %s (attempt %d/%d); backing off %.1fs",
+                        status,
+                        url,
+                        attempt + 1,
+                        self.max_retries,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2.0
+                    continue
+                raise CloudQuotasTransientError(
+                    f"HTTP {status} from {url} after {self.max_retries} retries"
+                )
+
+            payload = response.json()
+            if "error" in payload:
+                err = payload["error"]
+                code = err.get("code") if isinstance(err, dict) else None
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                if code in _RETRYABLE_STATUS_CODES or "RESOURCE_EXHAUSTED" in str(err):
+                    if attempt < self.max_retries:
+                        time.sleep(delay)
+                        delay *= 2.0
+                        continue
+                    raise CloudQuotasTransientError(msg)
+                raise CloudQuotasError(msg)
+            return payload
+
+        raise CloudQuotasTransientError(f"Exhausted retries for {url}")
 
     def list_quota_infos(self, container: str, service: str) -> list[QuotaDefinition]:
         """``container`` is e.g. ``projects/my-proj`` or ``organizations/123``."""
         cache_key = (container, service)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         url = f"{_BASE}/{container}/locations/global/services/{service}/quotaInfos"
         definitions: list[QuotaDefinition] = []
         page_token = ""
+        transient_failure = False
         try:
             while True:
                 params = {"pageSize": str(_PAGE_SIZE)}
@@ -106,13 +186,22 @@ class CloudQuotasSource:
                 page_token = payload.get("nextPageToken", "")
                 if not page_token:
                     break
+        except CloudQuotasTransientError as exc:
+            # Do not poison the cache with [] on transient 429/5xx exhaustion.
+            transient_failure = True
+            _LOG.warning(
+                "Transient Cloud Quotas failure for %s/%s: %s", container, service, exc
+            )
+            definitions = []
         except CloudQuotasError as exc:
             # A service with no quota surface, or one the caller cannot read,
             # must not abort the whole collection run.
             _LOG.warning("ListQuotaInfos failed for %s/%s: %s", container, service, exc)
             definitions = []
 
-        self._cache[cache_key] = definitions
+        if not transient_failure:
+            with self._lock:
+                self._cache[cache_key] = definitions
         return definitions
 
     def definitions_by_quota_id(
@@ -130,11 +219,13 @@ class CloudQuotasSource:
         Returns ``True`` if ``enablement == "ENABLED"``, ``False`` if
         ``"DISABLED"``, or ``None`` if unknown / unreachable.
         """
-        if container in self._adjuster_cache:
-            return self._adjuster_cache[container]
+        with self._lock:
+            if container in self._adjuster_cache:
+                return self._adjuster_cache[container]
 
         url = f"{_BASE_BETA}/{container}/locations/global/quotaAdjusterSettings"
         result: bool | None = None
+        transient_failure = False
         try:
             payload = self._get(url, {})
             enablement = str(payload.get("enablement", "")).upper()
@@ -142,11 +233,19 @@ class CloudQuotasSource:
                 result = True
             elif enablement == "DISABLED":
                 result = False
+        except CloudQuotasTransientError as exc:
+            transient_failure = True
+            _LOG.warning(
+                "Transient GetQuotaAdjusterSettings failure for %s: %s", container, exc
+            )
+            result = None
         except (CloudQuotasError, requests.RequestException) as exc:
             _LOG.warning("GetQuotaAdjusterSettings failed for %s: %s", container, exc)
             result = None
 
-        self._adjuster_cache[container] = result
+        if not transient_failure:
+            with self._lock:
+                self._adjuster_cache[container] = result
         return result
 
 

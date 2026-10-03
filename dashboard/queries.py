@@ -43,6 +43,11 @@ PROJECT = os.environ.get("QMS_PROJECT", "")
 DATASET = os.environ.get("QMS_DATASET", "quota_monitoring")
 LOCATION = os.environ.get("QMS_BQ_LOCATION", "US")
 CACHE_TTL = int(os.environ.get("QMS_CACHE_TTL", "300"))
+# 15,000 rows covers ~100-110 active projects completely in memory (~30 MB RAM,
+# safely within a 512 MiB Cloud Run container even during SWR background refresh).
+# Above 15,000 rows (e.g. 500 projects / ~70k rows), _all_facets() and targeted
+# parameterized queries ensure 100% lookup coverage without OOM-killing the worker.
+RISK_CACHE_LIMIT = int(os.environ.get("QMS_RISK_CACHE_LIMIT", "15000"))
 
 # Above this, a quota is shown as critical. Chosen to match the point at which
 # a quota increase request is worth filing rather than any property of the API.
@@ -174,18 +179,115 @@ class Repository:
     # ---------------------------------------------------------------- panels
 
     def _all_risk(self) -> list[dict]:
-        """Full comparable quota set (cached once; filtered in-memory)."""
+        """Comparable quota set (cached up to ``RISK_CACHE_LIMIT``; filtered in-memory)."""
 
         def produce() -> list[dict]:
             sql = f"""
             SELECT *
             FROM {self._view("quota_risk")}
             ORDER BY peak_ratio_30d DESC NULLS LAST, peak_ratio_7d DESC NULLS LAST
-            LIMIT 2000
+            LIMIT {int(RISK_CACHE_LIMIT)}
             """
             return self._rows(sql)
 
         return _cache.get_or_set("risk:all", produce)
+
+    def _all_facets(self) -> list[dict]:
+        """Uncapped ``(project_id, service, quota_metric)`` rollup across all comparable quotas.
+
+        When ``_all_risk()`` contains fewer than ``RISK_CACHE_LIMIT`` rows, it
+        already holds 100% of comparable quotas in the warehouse, so facets are
+        derived in-memory with 0 extra BigQuery queries. When an organization
+        exceeds ``RISK_CACHE_LIMIT`` rows (e.g. 500 projects / ~70k quotas),
+        this query aggregates by ``(project_id, service, quota_metric)`` so
+        headline KPIs and Project/Service/Quota Metric dropdowns remain 100%
+        complete while keeping Cloud Run memory safely inside 512 MiB.
+        """
+        risk_rows = self._all_risk()
+        if len(risk_rows) < RISK_CACHE_LIMIT:
+            grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for r in risk_rows:
+                pid = str(r.get("project_id") or "")
+                svc = str(r.get("service") or "")
+                met = str(r.get("quota_metric") or "")
+                if not pid:
+                    continue
+                key = (pid, svc, met)
+                ratio = r.get("peak_ratio_30d")
+                seen = r.get("last_seen")
+                item = grouped.get(key)
+                if item is None:
+                    grouped[key] = {
+                        "project_id": pid,
+                        "service": svc,
+                        "quota_metric": met,
+                        "quota_count": 1,
+                        "critical_count": 1 if (ratio is not None and ratio >= CRITICAL) else 0,
+                        "warning_count": (
+                            1 if (ratio is not None and WARNING <= ratio < CRITICAL) else 0
+                        ),
+                        "max_ratio_30d": ratio,
+                        "last_seen": seen,
+                    }
+                else:
+                    item["quota_count"] += 1
+                    if ratio is not None:
+                        if ratio >= CRITICAL:
+                            item["critical_count"] += 1
+                        elif ratio >= WARNING:
+                            item["warning_count"] += 1
+                        if item["max_ratio_30d"] is None or ratio > item["max_ratio_30d"]:
+                            item["max_ratio_30d"] = ratio
+                    if isinstance(seen, dt.date) and (
+                        item["last_seen"] is None or seen > item["last_seen"]
+                    ):
+                        item["last_seen"] = seen
+            return list(grouped.values())
+
+        def produce() -> list[dict]:
+            sql = f"""
+            SELECT
+              project_id,
+              service,
+              quota_metric,
+              COUNT(*) AS quota_count,
+              COUNTIF(peak_ratio_30d >= {CRITICAL}) AS critical_count,
+              COUNTIF(peak_ratio_30d >= {WARNING} AND peak_ratio_30d < {CRITICAL}) AS warning_count,
+              MAX(peak_ratio_30d) AS max_ratio_30d,
+              MAX(last_seen) AS last_seen
+            FROM {self._view("quota_risk")}
+            GROUP BY project_id, service, quota_metric
+            """
+            return self._rows(sql)
+
+        return _cache.get_or_set("risk:facets", produce)
+
+    def facets(
+        self,
+        *,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """Return per-(project_id, service, quota_metric) facet counts for the caller."""
+        rows = self._all_facets()
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "p": r.get("project_id", ""),
+                    "s": r.get("service", ""),
+                    "m": r.get("quota_metric", ""),
+                    "c": int(r.get("quota_count") or 0),
+                    "r": (
+                        round(float(r["max_ratio_30d"]), 4)
+                        if r.get("max_ratio_30d") is not None
+                        else -1.0
+                    ),
+                }
+            )
+        return out
 
     def _all_movers(self) -> list[dict]:
         """Cached movers across the organisation; filtered per user in-memory."""
@@ -296,13 +398,62 @@ class Repository:
         *,
         limit: int = 500,
         min_ratio: float = 0.0,
+        project_id: str = "",
+        service: str = "",
+        quota_metric: str = "",
         allowed_projects: Iterable[str] | None = None,
     ) -> list[dict]:
-        """The main table: every comparable quota, worst first."""
-        rows = self._all_risk()
-        if allowed_projects is not None:
-            allowed = set(allowed_projects)
+        """The main table: every comparable quota matching filters, worst first."""
+        cached_rows = self._all_risk()
+        allowed = set(allowed_projects) if allowed_projects is not None else None
+
+        # When the warehouse exceeds RISK_CACHE_LIMIT (e.g. 500 projects / ~70k
+        # rows) and the caller filters by project/service/metric, query BigQuery
+        # directly for that slice so low-utilization quotas outside the top
+        # RISK_CACHE_LIMIT are still returned in full.
+        if len(cached_rows) >= RISK_CACHE_LIMIT and (project_id or service or quota_metric):
+            if allowed is not None and project_id and project_id not in allowed:
+                return []
+
+            def produce_filtered() -> list[dict]:
+                clauses = ["TRUE"]
+                params: list[bigquery.ScalarQueryParameter] = []
+                if project_id:
+                    clauses.append("project_id = @project_id")
+                    params.append(
+                        bigquery.ScalarQueryParameter("project_id", "STRING", project_id)
+                    )
+                if service:
+                    clauses.append("service = @service")
+                    params.append(bigquery.ScalarQueryParameter("service", "STRING", service))
+                if quota_metric:
+                    clauses.append("quota_metric = @quota_metric")
+                    params.append(
+                        bigquery.ScalarQueryParameter("quota_metric", "STRING", quota_metric)
+                    )
+                where_sql = " AND ".join(clauses)
+                sql = f"""
+                SELECT *
+                FROM {self._view("quota_risk")}
+                WHERE {where_sql}
+                ORDER BY peak_ratio_30d DESC NULLS LAST, peak_ratio_7d DESC NULLS LAST
+                LIMIT 2000
+                """
+                return self._rows(sql, params)
+
+            key = f"risk:slice:{project_id}:{service}:{quota_metric}"
+            rows = _cache.get_or_set(key, produce_filtered)
+        else:
+            rows = cached_rows
+
+        if allowed is not None:
             rows = [r for r in rows if r.get("project_id") in allowed]
+        if project_id:
+            rows = [r for r in rows if r.get("project_id") == project_id]
+        if service:
+            rows = [r for r in rows if r.get("service") == service]
+        if quota_metric:
+            rows = [r for r in rows if r.get("quota_metric") == quota_metric]
         if min_ratio > 0.0:
             rows = [r for r in rows if (r.get("peak_ratio_30d") or 0.0) >= min_ratio]
         return rows[:limit]
@@ -394,26 +545,24 @@ class Repository:
         *,
         allowed_projects: Iterable[str] | None = None,
     ) -> dict:
-        """Headline counters derived in-memory from cached risk + quality views."""
+        """Headline counters derived in-memory from cached facets + quality views."""
         allowed = set(allowed_projects) if allowed_projects is not None else None
-        risk_rows = [
-            r for r in self._all_risk() if allowed is None or r.get("project_id") in allowed
+        facet_rows = [
+            r for r in self._all_facets() if allowed is None or r.get("project_id") in allowed
         ]
         quality_rows = self.quality(allowed_projects=allowed)
 
+        tracked = 0
         critical = 0
         warning = 0
         projects: set[str] = set()
         services: set[str] = set()
         last_seen: dt.date | None = None
 
-        for r in risk_rows:
-            ratio = r.get("peak_ratio_30d")
-            if ratio is not None:
-                if ratio >= CRITICAL:
-                    critical += 1
-                elif ratio >= WARNING:
-                    warning += 1
+        for r in facet_rows:
+            tracked += int(r.get("quota_count") or 0)
+            critical += int(r.get("critical_count") or 0)
+            warning += int(r.get("warning_count") or 0)
             if r.get("project_id"):
                 projects.add(r["project_id"])
             if r.get("service"):
@@ -429,7 +578,7 @@ class Repository:
         )
 
         return {
-            "tracked": len(risk_rows),
+            "tracked": tracked,
             "critical": critical,
             "warning": warning,
             "projects": len(projects),
@@ -443,6 +592,9 @@ class Repository:
         *,
         limit: int = 500,
         min_ratio: float = 0.0,
+        project_id: str = "",
+        service: str = "",
+        quota_metric: str = "",
         allowed_projects: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Fetch all dashboard panels in parallel (1x BigQuery RTT when cold)."""
@@ -450,7 +602,15 @@ class Repository:
         allowed = set(allowed_projects) if allowed_projects is not None else None
         return {
             "summary": self.summary(allowed_projects=allowed),
-            "risk": self.risk(limit=limit, min_ratio=min_ratio, allowed_projects=allowed),
+            "facets": self.facets(allowed_projects=allowed),
+            "risk": self.risk(
+                limit=limit,
+                min_ratio=min_ratio,
+                project_id=project_id,
+                service=service,
+                quota_metric=quota_metric,
+                allowed_projects=allowed,
+            ),
             "movers": self.movers(allowed_projects=allowed),
             "hierarchy": self.hierarchy(allowed_projects=allowed),
             "quality": self.quality(allowed_projects=allowed),
@@ -497,7 +657,8 @@ class Repository:
               is_comparable,
               flags
             FROM `{self.project}.{self.dataset}.quota_daily`
-            WHERE project_id = @project_id
+            WHERE usage_date_utc >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
+              AND project_id = @project_id
               AND service = @service
               AND quota_metric = @quota_metric
               AND IFNULL(limit_name, '') = @limit_name
@@ -530,6 +691,7 @@ class Repository:
               MAX(usage_date_utc) AS latest_day,
               COUNT(*) AS rows_total
             FROM `{self.project}.{self.dataset}.quota_daily`
+            WHERE usage_date_utc >= DATE_SUB(CURRENT_DATE(), INTERVAL 35 DAY)
             """
             rows = self._rows(sql)
             return rows[0] if rows else {}

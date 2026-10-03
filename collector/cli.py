@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from .model import DailyRollup, QuotaDefinition
 from .rollup import UsageBundle, build_rollups
@@ -27,6 +28,7 @@ from .sources.hierarchy import HierarchySource
 from .sources.monitoring import MonitoringSource
 
 _LOG = logging.getLogger("qms")
+DEFAULT_COLLECTOR_WORKERS = int(os.environ.get("QMS_COLLECTOR_WORKERS", "8"))
 
 
 def utc_midnight(offset_days: int = 0) -> dt.datetime:
@@ -34,11 +36,34 @@ def utc_midnight(offset_days: int = 0) -> dt.datetime:
     return today - dt.timedelta(days=offset_days)
 
 
+def _collect_project_monitoring(
+    project_id: str,
+    *,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> tuple[list, list, list]:
+    """Collect allocation, daily rate, and minute rate usage for a single project."""
+    _LOG.info("collecting %s", project_id)
+    monitoring = MonitoringSource(project_id)
+    try:
+        alloc = monitoring.allocation_daily_peaks(start=start, end=end)
+        r_daily = monitoring.rate_daily_totals(start=start, end=end)
+        r_min = monitoring.rate_minute_peaks(start=start, end=end)
+        return alloc, r_daily, r_min
+    except Exception as exc:  # noqa: BLE001 - see below
+        # Intentionally broad. In an org-wide sweep a single project with a
+        # transient API error, a missing API, or a permissions gap must not
+        # abort collection for every other project.
+        _LOG.error("monitoring read failed for %s: %s", project_id, exc)
+        return [], [], []
+
+
 def gather(
     *,
     projects: list[str],
     billing_project: str,
     days: int,
+    max_workers: int | None = None,
 ) -> tuple[UsageBundle, dict[tuple[str, str], list[QuotaDefinition]]]:
     end = utc_midnight()
     start = utc_midnight(days)
@@ -48,20 +73,24 @@ def gather(
     rate_daily: list = []
     rate_minute: list = []
     definitions: dict[tuple[str, str], list[QuotaDefinition]] = {}
+    workers = max(1, max_workers if max_workers is not None else DEFAULT_COLLECTOR_WORKERS)
 
-    for project_id in projects:
-        _LOG.info("collecting %s", project_id)
-        monitoring = MonitoringSource(project_id)
-        try:
-            allocation.extend(monitoring.allocation_daily_peaks(start=start, end=end))
-            rate_daily.extend(monitoring.rate_daily_totals(start=start, end=end))
-            rate_minute.extend(monitoring.rate_minute_peaks(start=start, end=end))
-        except Exception as exc:  # noqa: BLE001 - see below
-            # Intentionally broad. In an org-wide sweep a single project with a
-            # transient API error, a missing API, or a permissions gap must not
-            # abort collection for every other project.
-            _LOG.error("monitoring read failed for %s: %s", project_id, exc)
-            continue
+    if len(projects) <= 1 or workers == 1:
+        per_project_results = [
+            _collect_project_monitoring(pid, start=start, end=end) for pid in projects
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(projects))) as pool:
+            futs = [
+                pool.submit(_collect_project_monitoring, pid, start=start, end=end)
+                for pid in projects
+            ]
+            per_project_results = [fut.result() for fut in futs]
+
+    for alloc, r_daily, r_min in per_project_results:
+        allocation.extend(alloc)
+        rate_daily.extend(r_daily)
+        rate_minute.extend(r_min)
 
     bundle = UsageBundle(allocation, rate_daily, rate_minute)
 
@@ -71,11 +100,24 @@ def gather(
     # extra round trip and a silent mismatch: an instant query only looks back
     # five minutes, and these metrics are written sporadically enough that it
     # routinely returns nothing.
-    for owner, service in sorted(active_services(bundle)):
-        key = (owner, service)
-        if key in definitions:
-            continue
-        definitions[key] = quotas.list_quota_infos(f"projects/{owner}", service)
+    # CloudQuotasSource enforces a thread-safe 14 RPS token bucket so concurrent
+    # workers stay well below the 1,200 RPM ReadRequestsPerMinute quota.
+    pairs = sorted(active_services(bundle))
+    if len(pairs) <= 1 or workers == 1:
+        for owner, service in pairs:
+            definitions[(owner, service)] = quotas.list_quota_infos(
+                f"projects/{owner}", service
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(pairs))) as pool:
+            fut_by_key = {
+                (owner, service): pool.submit(
+                    quotas.list_quota_infos, f"projects/{owner}", service
+                )
+                for owner, service in pairs
+            }
+            for key in pairs:
+                definitions[key] = fut_by_key[key].result()
 
     _LOG.info(
         "fetched %d quota definitions across %d (project, service) pairs",
@@ -103,21 +145,35 @@ def enrich_placements(
     placements: dict[str, Placement],
     *,
     billing_project: str,
+    max_workers: int | None = None,
 ) -> dict[str, Placement]:
     """Attach read-only ``quota_adjuster_enabled`` status to each project's placement."""
     quotas = CloudQuotasSource(billing_project=billing_project)
     enriched: dict[str, Placement] = {}
+    workers = max(1, max_workers if max_workers is not None else DEFAULT_COLLECTOR_WORKERS)
+
+    if len(projects) <= 1 or workers == 1:
+        enabled_by_proj = {
+            pid: quotas.get_quota_adjuster_enabled(f"projects/{pid}") for pid in projects
+        }
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(projects))) as pool:
+            fut_by_proj = {
+                pid: pool.submit(quotas.get_quota_adjuster_enabled, f"projects/{pid}")
+                for pid in projects
+            }
+            enabled_by_proj = {pid: fut_by_proj[pid].result() for pid in projects}
+
     for project_id in projects:
         base = placements.get(
             project_id,
             Placement(org_id=None, folder_id=None, project_number=None),
         )
-        enabled = quotas.get_quota_adjuster_enabled(f"projects/{project_id}")
         enriched[project_id] = Placement(
             org_id=base.org_id,
             folder_id=base.folder_id,
             project_number=base.project_number,
-            quota_adjuster_enabled=enabled,
+            quota_adjuster_enabled=enabled_by_proj.get(project_id),
         )
     return enriched
 

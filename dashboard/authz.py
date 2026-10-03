@@ -32,6 +32,7 @@ import os
 import threading
 import time
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,7 @@ import requests
 from fastapi import Request
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
+from requests.adapters import HTTPAdapter
 
 _LOG = logging.getLogger(__name__)
 
@@ -62,6 +64,8 @@ _FALLBACK_VIEWER_ROLES = frozenset(
     }
 )
 AUTHZ_CACHE_TTL = int(os.environ.get("QMS_AUTHZ_CACHE_TTL", "300"))
+MAX_CRM_FALLBACK_PROJECTS = int(os.environ.get("QMS_MAX_CRM_FALLBACK_PROJECTS", "60"))
+_AUTHZ_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="qms-authz")
 
 
 class UnauthenticatedError(Exception):
@@ -266,6 +270,7 @@ class Authorizer:
         default_org_id: str | None = None,
         session: requests.Session | None = None,
         cache_ttl: int = AUTHZ_CACHE_TTL,
+        max_crm_fallback_projects: int = MAX_CRM_FALLBACK_PROJECTS,
     ) -> None:
         self.permission = (
             permission or os.environ.get("QMS_REQUIRED_PERMISSION") or DEFAULT_PERMISSION
@@ -274,23 +279,31 @@ class Authorizer:
         self.default_org_id = default_org_id or os.environ.get("QMS_ORG", "")
         self._session = session
         self._cache_ttl = cache_ttl
+        self.max_crm_fallback_projects = max_crm_fallback_projects
         self._cache: dict[str, tuple[frozenset[str], float]] = {}
+        self._refreshing: set[str] = set()
         self._lock = threading.Lock()
 
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._refreshing.clear()
 
     def _authed_session(self) -> requests.Session:
-        if self._session is not None:
+        with self._lock:
+            if self._session is not None:
+                return self._session
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            if self.quota_project and hasattr(creds, "with_quota_project"):
+                creds = creds.with_quota_project(self.quota_project)
+            sess = google_requests.AuthorizedSession(creds)
+            adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            self._session = sess
             return self._session
-        creds, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        if self.quota_project and hasattr(creds, "with_quota_project"):
-            creds = creds.with_quota_project(self.quota_project)
-        self._session = google_requests.AuthorizedSession(creds)
-        return self._session
 
     def _custom_role_has_permission(self, role_name: str) -> bool:
         """Check whether a custom IAM role (`projects/.../roles/...` or `organizations/.../roles/...`) includes `self.permission`."""
@@ -327,18 +340,15 @@ class Authorizer:
                 return True
         return False
 
-    def _analyze_scope(self, scope: str, email: str) -> tuple[set[str], set[str], set[str]]:
+    def _analyze_scope_with_status(
+        self, scope: str, email: str
+    ) -> tuple[set[str], set[str], set[str], bool]:
         """Evaluate ``scope`` via Cloud Asset ``analyzeIamPolicy`` + CRM ``getIamPolicy``.
 
-        Cloud Asset ``analyzeIamPolicy`` is queried using ``accessSelector.roles``
-        because ``cloudquotas.quotaInfos.list`` is defined on child resource type
-        ``cloudquotas.googleapis.com/QuotaInfo`` rather than CRM hierarchy nodes
-        (so querying ``accessSelector.permissions=cloudquotas.quotaInfos.list``
-        on a CRM scope returns ``HTTP 200`` with empty ``analysisResults``).
-        Whenever the scope itself is not already granted by Cloud Asset (for
-        instance due to CAI eventual-consistency indexing lag after a fresh role
-        grant, a custom role, or missing ``cloudasset.viewer`` permissions), we
-        also check strongly-consistent CRM v3 ``getIamPolicy`` on ``scope``.
+        Returns ``(orgs, folders, projects, cai_ok)``.
+        When ``cai_ok`` is True on an ``organizations/{id}`` scope and already
+        returns >=1 granted resource, Cloud Asset Inventory has already searched
+        the entire Org + Folder + Project hierarchy in a single RPC.
         """
         url = f"{CLOUD_ASSET_BASE}/{scope}:analyzeIamPolicy"
         params: list[tuple[str, str]] = [
@@ -359,13 +369,12 @@ class Authorizer:
             cai_ok = True
             orgs, folders, projs = _parse_resource_grants(resp.json())
 
-        scope_id = scope.split("/", 1)[1] if "/" in scope else scope
-        scope_already_granted = (
-            (scope.startswith("organizations/") and scope_id in orgs)
-            or (scope.startswith("folders/") and scope_id in folders)
-            or (scope.startswith("projects/") and scope_id in projs)
-        )
-        if not scope_already_granted and self._crm_has_viewer_binding(scope, email):
+        # If Cloud Asset already returned grants in this hierarchy, no CRM
+        # getIamPolicy call is needed on this scope. Only check CRM when CAI
+        # returned 0 grants (e.g., fresh IAM binding within CAI's indexing lag
+        # window or custom role) or when CAI failed (e.g., HTTP 403).
+        has_any_cai_grant = bool(orgs or folders or projs)
+        if not has_any_cai_grant and self._crm_has_viewer_binding(scope, email):
             crm_orgs, crm_folders, crm_projs = _parse_resource_grants(
                 {
                     "mainAnalysis": {
@@ -382,14 +391,156 @@ class Authorizer:
             orgs |= crm_orgs
             folders |= crm_folders
             projs |= crm_projs
-            return orgs, folders, projs
+            return orgs, folders, projs, cai_ok
 
         if cai_ok:
-            return orgs, folders, projs
+            return orgs, folders, projs, True
 
         raise RuntimeError(
             f"analyzeIamPolicy on {scope} returned HTTP {resp.status_code}: {resp.text[:300]}"
         )
+
+    def _analyze_scope(self, scope: str, email: str) -> tuple[set[str], set[str], set[str]]:
+        orgs, folders, projs, _ = self._analyze_scope_with_status(scope, email)
+        return orgs, folders, projs
+
+    def _compute_allowed_projects(
+        self,
+        clean_email: str,
+        target_list: list[ProjectTarget],
+    ) -> frozenset[str]:
+        allowed_orgs: set[str] = set()
+        allowed_folders: set[str] = set()
+        allowed_projs: set[str] = set()
+        cai_explored_orgs: set[str] = set()
+
+        def _is_target_authorized(t: ProjectTarget) -> bool:
+            return bool(
+                (t.org_id and t.org_id in allowed_orgs)
+                or (t.folder_id and t.folder_id in allowed_folders)
+                or (t.project_id in allowed_projs)
+                or (t.project_number and str(t.project_number) in allowed_projs)
+            )
+
+        # 1. Check Organization scope first.
+        #    When Cloud Asset Inventory (expandResources=true, expandGroups=true)
+        #    succeeds on an Org and returns >=1 authorized target, the entire
+        #    Org + Folder + Project tree has already been evaluated in 1 RPC.
+        org_ids = sorted(
+            {t.org_id for t in target_list if t.org_id}
+            | ({self.default_org_id} if self.default_org_id else set())
+        )
+        for org_id in org_ids:
+            try:
+                orgs, folders, projs, cai_ok = self._analyze_scope_with_status(
+                    f"organizations/{org_id}", clean_email
+                )
+                allowed_orgs |= orgs
+                allowed_folders |= folders
+                allowed_projs |= projs
+                if cai_ok:
+                    cai_explored_orgs.add(org_id)
+            except Exception:  # noqa: BLE001 - fall back to folder/project scopes
+                _LOG.debug(
+                    "org-level IAM check unavailable for organizations/%s; "
+                    "checking folder/project scopes",
+                    org_id,
+                )
+
+        # Determine which targets still need Folder / Project checks:
+        # - Targets in an org where CAI failed (t.org_id not in cai_explored_orgs)
+        #   need full _analyze_scope fallback on their Folder/Project.
+        # - Targets in an org where CAI succeeded (HTTP 200) and ALREADY granted
+        #   >=1 project in that org do NOT need 100-500 redundant per-project RPCs!
+        # - Targets in an org where CAI succeeded (HTTP 200) but returned 0
+        #   authorized projects are checked via strongly-consistent CRM getIamPolicy
+        #   (handles fresh project/folder IAM grants during CAI indexing lag).
+        orgs_with_grants = {
+            t.org_id for t in target_list if t.org_id and _is_target_authorized(t)
+        }
+
+        remaining_after_org: Sequence[ProjectTarget] = [
+            t
+            for t in target_list
+            if not _is_target_authorized(t)
+            and (t.org_id not in cai_explored_orgs or t.org_id not in orgs_with_grants)
+        ]
+
+        # 2. Check distinct Folder scopes for remaining targets.
+        folder_ids = sorted({t.folder_id for t in remaining_after_org if t.folder_id})
+        for folder_id in folder_ids:
+            try:
+                orgs, folders, projs = self._analyze_scope(f"folders/{folder_id}", clean_email)
+                allowed_orgs |= orgs
+                allowed_folders |= folders
+                allowed_projs |= projs
+            except Exception:  # noqa: BLE001
+                _LOG.debug(
+                    "folder-level IAM check unavailable for folders/%s; checking project scope",
+                    folder_id,
+                )
+
+        # 3. Check remaining Project scopes (bounded by max_crm_fallback_projects
+        #    and executed concurrently when multiple projects remain).
+        orgs_with_grants = {
+            t.org_id for t in target_list if t.org_id and _is_target_authorized(t)
+        }
+        remaining_after_folder: list[ProjectTarget] = [
+            t
+            for t in remaining_after_org
+            if not _is_target_authorized(t)
+            and (t.org_id not in cai_explored_orgs or t.org_id not in orgs_with_grants)
+        ][: self.max_crm_fallback_projects]
+
+        def _check_project(target: ProjectTarget) -> tuple[set[str], set[str], set[str]]:
+            try:
+                # If Org CAI already returned 200 OK (empty), skip redundant
+                # project-level CAI call and check strongly-consistent CRM directly.
+                if target.org_id in cai_explored_orgs:
+                    if self._crm_has_viewer_binding(
+                        f"projects/{target.project_id}", clean_email
+                    ):
+                        return set(), set(), {target.project_id}
+                    return set(), set(), set()
+                return self._analyze_scope(f"projects/{target.project_id}", clean_email)
+            except Exception:  # noqa: BLE001
+                _LOG.debug(
+                    "project-level IAM check unavailable for projects/%s",
+                    target.project_id,
+                )
+                return set(), set(), set()
+
+        if len(remaining_after_folder) == 1:
+            orgs, folders, projs = _check_project(remaining_after_folder[0])
+            allowed_orgs |= orgs
+            allowed_folders |= folders
+            allowed_projs |= projs
+        elif len(remaining_after_folder) > 1:
+            futs = [_AUTHZ_POOL.submit(_check_project, t) for t in remaining_after_folder]
+            for fut in futs:
+                orgs, folders, projs = fut.result()
+                allowed_orgs |= orgs
+                allowed_folders |= folders
+                allowed_projs |= projs
+
+        authorized = {t.project_id for t in target_list if _is_target_authorized(t)}
+        return frozenset(authorized)
+
+    def _background_refresh(
+        self,
+        cache_key: str,
+        clean_email: str,
+        target_list: list[ProjectTarget],
+    ) -> None:
+        try:
+            result = self._compute_allowed_projects(clean_email, target_list)
+            with self._lock:
+                self._cache[cache_key] = (result, time.monotonic() + self._cache_ttl)
+        except Exception:  # noqa: BLE001
+            _LOG.warning("background authz refresh failed for %s", clean_email, exc_info=True)
+        finally:
+            with self._lock:
+                self._refreshing.discard(cache_key)
 
     def allowed_projects(
         self,
@@ -413,81 +564,19 @@ class Authorizer:
         now = time.monotonic()
         with self._lock:
             cached = self._cache.get(cache_key)
-            if cached is not None and cached[1] > now:
+            if cached is not None:
+                if cached[1] > now:
+                    return cached[0]
+                # Stale-while-revalidate: serve cached projects in 0ms while
+                # refreshing IAM bindings asynchronously in the background.
+                if cache_key not in self._refreshing:
+                    self._refreshing.add(cache_key)
+                    _AUTHZ_POOL.submit(
+                        self._background_refresh, cache_key, clean_email, target_list
+                    )
                 return cached[0]
 
-        allowed_orgs: set[str] = set()
-        allowed_folders: set[str] = set()
-        allowed_projs: set[str] = set()
-
-        def _is_target_authorized(t: ProjectTarget) -> bool:
-            return bool(
-                (t.org_id and t.org_id in allowed_orgs)
-                or (t.folder_id and t.folder_id in allowed_folders)
-                or (t.project_id in allowed_projs)
-                or (t.project_number and str(t.project_number) in allowed_projs)
-            )
-
-        # 1. Check Organization scope first. If the caller holds org-level access
-        #    (or CAI expandResources=true returns all child grants), _is_target_authorized
-        #    will be True for those targets and no folder/project calls are needed.
-        org_ids = sorted(
-            {t.org_id for t in target_list if t.org_id}
-            | ({self.default_org_id} if self.default_org_id else set())
-        )
-        for org_id in org_ids:
-            try:
-                orgs, folders, projs = self._analyze_scope(
-                    f"organizations/{org_id}", clean_email
-                )
-                allowed_orgs |= orgs
-                allowed_folders |= folders
-                allowed_projs |= projs
-            except Exception:  # noqa: BLE001 - fall back to folder/project scopes
-                _LOG.debug(
-                    "org-level IAM check unavailable for organizations/%s; "
-                    "checking folder/project scopes",
-                    org_id,
-                )
-
-        # 2. For any target not yet authorized at the Org level, check its Folder
-        #    scope (handles folder-scoped bindings and zero-lag CRM getIamPolicy).
-        remaining_after_org: Sequence[ProjectTarget] = [
-            t for t in target_list if not _is_target_authorized(t)
-        ]
-        for folder_id in sorted({t.folder_id for t in remaining_after_org if t.folder_id}):
-            try:
-                orgs, folders, projs = self._analyze_scope(f"folders/{folder_id}", clean_email)
-                allowed_orgs |= orgs
-                allowed_folders |= folders
-                allowed_projs |= projs
-            except Exception:  # noqa: BLE001
-                _LOG.debug(
-                    "folder-level IAM check unavailable for folders/%s; checking project scope",
-                    folder_id,
-                )
-
-        # 3. For any target still not authorized after Org and Folder checks,
-        #    check its Project scope directly.
-        remaining_after_folder: Sequence[ProjectTarget] = [
-            t for t in target_list if not _is_target_authorized(t)
-        ]
-        for target in remaining_after_folder:
-            try:
-                orgs, folders, projs = self._analyze_scope(
-                    f"projects/{target.project_id}", clean_email
-                )
-                allowed_orgs |= orgs
-                allowed_folders |= folders
-                allowed_projs |= projs
-            except Exception:  # noqa: BLE001
-                _LOG.debug(
-                    "project-level IAM check unavailable for projects/%s",
-                    target.project_id,
-                )
-
-        authorized = {t.project_id for t in target_list if _is_target_authorized(t)}
-        result = frozenset(authorized)
+        result = self._compute_allowed_projects(clean_email, target_list)
         with self._lock:
             self._cache[cache_key] = (result, time.monotonic() + self._cache_ttl)
         return result
