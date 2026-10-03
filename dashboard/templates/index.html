@@ -232,12 +232,15 @@
                 data-metric="{{ row.quota_metric }}"
                 data-limit="{{ row.limit_name or '' }}"
                 data-location="{{ row.location }}"
+                data-qclass="{{ row.quota_class or 'RATE' }}"
+                data-interval="{{ row.interval_seconds or 60 }}"
                 data-adjuster="{{ 'ENABLED' if row.quota_adjuster_enabled is true else ('DISABLED' if row.quota_adjuster_enabled is false else 'UNKNOWN') }}"
                 data-ratio30="{{ row.peak_ratio_30d if row.peak_ratio_30d is not none else -1 }}"
                 data-ratio7="{{ row.peak_ratio_7d if row.peak_ratio_7d is not none else -1 }}"
                 data-peak7="{{ row.peak_usage_7d if row.peak_usage_7d is not none else -1 }}"
                 data-limitval="{{ 999999999999999999 if row.is_unlimited else (row.limit_value if row.limit_value is not none else -1) }}"
                 data-search="{{ (row.project_id ~ ' ' ~ row.service ~ ' ' ~ row.quota_metric ~ ' ' ~ (row.limit_name or '') ~ ' ' ~ (row.location or '') ~ ' ' ~ (row.quota_class or '')) | lower }}">
+
               <!-- 1. Project -->
               <td class="cell-project mono" data-sort="{{ row.project_id }}">{{ row.project_id }}</td>
 
@@ -465,9 +468,11 @@
     <div style="height: 250px; background: #f8fafc; border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px;">
       <canvas id="drawer-chart"></canvas>
     </div>
-    <div id="drawer-table" style="margin-top: 18px;"></div>
+    <div id="drawer-console-actions" style="margin-top: 14px;"></div>
+    <div id="drawer-table" style="margin-top: 16px;"></div>
   </div>
 </aside>
+
 
 {% endblock %}
 
@@ -756,6 +761,56 @@
 
   // ---------------------------------------------------------------- Drawer
   let chart = null;
+  let currentDrawerPromql = '';
+
+  function buildConsolePromql(tr) {
+    const proj = tr.dataset.project || '';
+    const metric = tr.dataset.metric || '';
+    const loc = tr.dataset.location || 'global';
+    const qclass = (tr.dataset.qclass || 'RATE').toUpperCase();
+    const interval = parseInt(tr.dataset.interval || '60', 10);
+    const limitVal = parseFloat(tr.dataset.limitval || '-1');
+
+    let expr;
+    if (qclass === 'ALLOCATION') {
+      expr = `max by (project_id, quota_metric, location) ({"serviceruntime.googleapis.com/quota/allocation/usage", monitored_resource="consumer_quota", project_id="${proj}", quota_metric="${metric}", location="${loc}"})`;
+    } else {
+      const win = interval >= 86400 ? '1d' : '1m';
+      expr = `sum by (project_id, quota_metric, location) (increase({"serviceruntime.googleapis.com/quota/rate/net_usage", monitored_resource="consumer_quota", project_id="${proj}", quota_metric="${metric}", location="${loc}"}[${win}]))`;
+    }
+    if (limitVal > 0 && limitVal < 1e17) {
+      return `(${expr} / ${Math.round(limitVal)}) >= 0.80`;
+    }
+    return expr;
+  }
+
+  async function copyDrawerPromql() {
+    if (!currentDrawerPromql) return;
+    try {
+      await navigator.clipboard.writeText(currentDrawerPromql);
+      const btn = document.getElementById('btn-copy-promql');
+      if (btn) {
+        const prev = btn.textContent;
+        btn.textContent = 'Copied PromQL!';
+        setTimeout(() => { btn.textContent = prev; }, 1800);
+      }
+    } catch (_err) {
+      // Fallback
+    }
+  }
+
+  function jumpToAlertQuota(projectId, quotaMetric, limitName, location) {
+    const pop = document.getElementById('alerts-popover');
+    if (pop) pop.classList.remove('open');
+    showTab('risk');
+    const match = riskRows.find(
+      r => r.project === projectId && r.metric === quotaMetric &&
+           (r.limit === limitName || !limitName) && (r.location === location || !location)
+    );
+    if (match && match.el) {
+      openDrawer(match.el);
+    }
+  }
 
   async function openDrawer(tr) {
     const q = new URLSearchParams({
@@ -772,6 +827,33 @@
       `${tr.dataset.project} · ${shortService(tr.dataset.service)} · ${tr.dataset.limit || 'default'} · ${tr.dataset.location}${adjLabel}`;
     document.getElementById('drawer').classList.add('open');
     document.getElementById('scrim').classList.add('open');
+
+    currentDrawerPromql = buildConsolePromql(tr);
+    const quotasUrl = `https://console.cloud.google.com/iam-admin/quotas?project=${encodeURIComponent(tr.dataset.project)}`;
+    const alertingUrl = `https://console.cloud.google.com/monitoring/alerting/policies/create?project=${encodeURIComponent(tr.dataset.project)}`;
+    const actionsEl = document.getElementById('drawer-console-actions');
+    if (actionsEl) {
+      actionsEl.innerHTML = `
+        <div class="table-card" style="padding: 12px 14px; background: #f8fafc;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--text-primary);">
+              Cloud Console Quota &amp; Real-Time Alerting
+            </span>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+              <button type="button" id="btn-copy-promql" class="btn-mini" onclick="copyDrawerPromql()" title="Copy ready-to-paste PromQL condition (&ge; 80% of authoritative limit)">
+                Copy PromQL (&ge; 80%)
+              </button>
+              <a href="${alertingUrl}" target="_blank" rel="noopener noreferrer" class="btn-mini" style="text-decoration: none;">
+                Create Alert in Cloud Console &#8599;
+              </a>
+              <a href="${quotasUrl}" target="_blank" rel="noopener noreferrer" class="btn-mini" style="text-decoration: none;">
+                Manage Quota in Console &#8599;
+              </a>
+            </div>
+          </div>
+          <pre class="mono" style="margin: 8px 0 0; padding: 8px 10px; background: #ffffff; border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 11px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-all;">${currentDrawerPromql}</pre>
+        </div>`;
+    }
 
     const res = await fetch('/api/history?' + q);
     const { series } = await res.json();
@@ -837,6 +919,7 @@
         </table>
       </div>`;
   }
+
 
   function closeDrawer() {
     document.getElementById('drawer').classList.remove('open');

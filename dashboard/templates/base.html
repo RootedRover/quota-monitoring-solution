@@ -181,6 +181,102 @@
       to { transform: rotate(360deg); }
     }
 
+    /* Alert Bell & Popover */
+    .alert-bell-wrap {
+      position: relative;
+      display: inline-flex;
+    }
+    .alert-badge-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      background: #334155;
+      color: #cbd5e1;
+    }
+    .alert-badge-count.has-alerts {
+      background: #dc2626;
+      color: #ffffff;
+      box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.28);
+    }
+    .alerts-popover {
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      width: 420px;
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-md);
+      z-index: 200;
+      display: none;
+      overflow: hidden;
+    }
+    .alerts-popover.open {
+      display: block;
+    }
+    .alerts-pop-header {
+      padding: 10px 14px;
+      background: var(--bg-subtle);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .alerts-push-bar {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: #f8fafc;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+    }
+    .alerts-pop-list {
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .alerts-pop-item {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+    .alerts-pop-item:hover {
+      background: var(--bg-hover);
+    }
+    .btn-mini {
+      padding: 4px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border-strong);
+      background: #ffffff;
+      color: var(--text-primary);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-mini:hover {
+      border-color: var(--brand-blue);
+      color: var(--brand-blue);
+    }
+
+
     /* Main Container */
     .console-main {
       max-width: 1680px;
@@ -822,6 +918,52 @@
           <span>&middot; {{ authz.allowed_count }}/{{ authz.total_projects }} projects</span>
         </div>
         {% endif %}
+
+        {% set alert_list = alerts or [] %}
+        {% set thresh_pct = ((alert_threshold or 0.80) * 100) | int %}
+        <div class="alert-bell-wrap" id="alert-bell-root">
+          <button type="button" id="btn-alerts" class="btn-header" onclick="toggleAlertsPopover(event)" title="Quota utilization alerts (&ge; {{ thresh_pct }}%) and browser push notifications">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+            <span>Alerts</span>
+            <span id="alert-badge-count" class="alert-badge-count {% if alert_list | length > 0 %}has-alerts{% endif %}">{{ alert_list | length }}</span>
+          </button>
+
+          <div id="alerts-popover" class="alerts-popover" onclick="event.stopPropagation()">
+            <div class="alerts-pop-header">
+              <span>Threshold Alerts (&ge; {{ thresh_pct }}% Utilization)</span>
+              <span class="mono" style="color: var(--text-secondary); font-size: 11px;">{{ alert_list | length }} active</span>
+            </div>
+            <div class="alerts-push-bar">
+              <span id="push-status-label">Browser push on daily &ge; {{ thresh_pct }}% breaches</span>
+              <div style="display: flex; gap: 6px;">
+                <button type="button" id="btn-enable-push" class="btn-mini" onclick="enableBrowserPush()">Enable push</button>
+                <button type="button" id="btn-test-push" class="btn-mini" onclick="sendTestPush()" title="Send a sample desktop push notification">Test</button>
+              </div>
+            </div>
+            <div class="alerts-pop-list" id="alerts-pop-list">
+              {% if alert_list %}
+                {% for a in alert_list %}
+                  {% set a_metric_short = a.quota_metric.split('/', 1)[1] if (a.quota_metric and '/' in a.quota_metric) else (a.quota_metric or '') %}
+                  <div class="alerts-pop-item" onclick="jumpToAlertQuota('{{ a.project_id }}', '{{ a.quota_metric }}', '{{ a.limit_name }}', '{{ a.location }}')">
+                    <div style="min-width: 0;">
+                      <div class="mono" style="font-size: 12px; font-weight: 600; color: var(--brand-blue); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ a_metric_short }}</div>
+                      <div class="mono" style="font-size: 11px; color: var(--text-secondary);">{{ a.project_id }} &middot; {{ a.location or 'global' }}</div>
+                    </div>
+                    <span class="sev-badge {% if a.worst_ratio >= 0.9 %}sev-critical{% else %}sev-warning{% endif %}">{{ (a.worst_ratio * 100) | round(1) }}%</span>
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="dd-empty" style="padding: 20px 14px;">
+                  All comparable quotas in your authorized projects are currently below {{ thresh_pct }}%.
+                </div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
         <button id="btn-refresh-cache" onclick="refreshCache()" class="btn-header" title="Clear in-memory cache and reload from BigQuery views">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
@@ -862,7 +1004,102 @@
       await fetch('/api/refresh', { method: 'POST' });
       location.reload();
     }
+
+    function toggleAlertsPopover(ev) {
+      ev.stopPropagation();
+      const pop = document.getElementById('alerts-popover');
+      if (pop) {
+        pop.classList.toggle('open');
+        syncPushButtonState();
+      }
+    }
+
+    document.addEventListener('click', () => {
+      const pop = document.getElementById('alerts-popover');
+      if (pop) pop.classList.remove('open');
+    });
+
+    function syncPushButtonState() {
+      const btn = document.getElementById('btn-enable-push');
+      const label = document.getElementById('push-status-label');
+      if (!btn || !label) return;
+      if (!('Notification' in window)) {
+        label.textContent = 'Browser notifications unsupported';
+        btn.style.display = 'none';
+        return;
+      }
+      if (Notification.permission === 'granted') {
+        btn.textContent = 'Push ON';
+        btn.style.borderColor = 'var(--sev-ok-border)';
+        btn.style.color = 'var(--sev-ok-text)';
+      } else if (Notification.permission === 'denied') {
+        btn.textContent = 'Blocked in browser';
+      } else {
+        btn.textContent = 'Enable push';
+      }
+    }
+
+    async function enableBrowserPush() {
+      if (!('Notification' in window)) return;
+      const perm = await Notification.requestPermission();
+      syncPushButtonState();
+      if (perm === 'granted') {
+        await checkAndNotifyAlerts(true);
+      }
+    }
+
+    function sendTestPush() {
+      if (!('Notification' in window)) return;
+      if (Notification.permission !== 'granted') {
+        enableBrowserPush();
+        return;
+      }
+      const n = new Notification('Cloud Quota Monitoring — Alert Check', {
+        body: 'Browser push notifications are active for quotas crossing 80% utilization.',
+        icon: '/favicon.png?v=6',
+      });
+      n.onclick = () => { window.focus(); n.close(); };
+    }
+
+    async function checkAndNotifyAlerts(forceNotify = false) {
+      if (!('Notification' in window) || Notification.permission !== 'granted') return;
+      try {
+        const res = await fetch('/api/alerts');
+        if (!res.ok) return;
+        const data = await res.json();
+        const badge = document.getElementById('alert-badge-count');
+        if (badge) {
+          badge.textContent = String(data.count || 0);
+          badge.classList.toggle('has-alerts', (data.count || 0) > 0);
+        }
+        if (!data.count || data.count <= 0) return;
+        const snapKey = `${data.snapshot_time}:${data.count}`;
+        const lastNotified = localStorage.getItem('qms_last_notified_snapshot');
+        if (!forceNotify && lastNotified === snapKey) return;
+        localStorage.setItem('qms_last_notified_snapshot', snapKey);
+
+        const top = data.alerts[0];
+        const metricShort = top.quota_metric.includes('/') ? top.quota_metric.split('/', 2)[1] : top.quota_metric;
+        const pct = (top.worst_ratio * 100).toFixed(1);
+        const n = new Notification(`QMS Quota Alert: ${data.count} quota(s) >= ${Math.round(data.threshold * 100)}%`, {
+          body: `Highest: ${top.project_id} · ${metricShort} (${top.location}) at ${pct}%`,
+          icon: '/favicon.png?v=6',
+        });
+        n.onclick = () => {
+          window.focus();
+          if (typeof setMinRatio === 'function') setMinRatio(0.8);
+          n.close();
+        };
+      } catch (_err) {
+        // Ignore transient background poll errors
+      }
+    }
+
+    syncPushButtonState();
+    checkAndNotifyAlerts(false);
+    setInterval(() => checkAndNotifyAlerts(false), 15 * 60 * 1000);
   </script>
   {% block scripts %}{% endblock %}
 </body>
 </html>
+

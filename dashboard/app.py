@@ -179,6 +179,33 @@ def readyz() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+def _extract_alerts(risk_rows: list[dict], threshold: float) -> list[dict]:
+    """Return comparable quotas whose 7d, 30d, or current ratio meets ``threshold``."""
+    out: list[dict] = []
+    for row in risk_rows:
+        r30 = float(row.get("peak_ratio_30d") or 0.0)
+        r7 = float(row.get("peak_ratio_7d") or 0.0)
+        rcurr = float(row.get("current_ratio") or 0.0)
+        worst = max(r30, r7, rcurr)
+        if worst >= threshold:
+            out.append(
+                {
+                    "project_id": row.get("project_id", ""),
+                    "service": row.get("service", ""),
+                    "quota_metric": row.get("quota_metric", ""),
+                    "limit_name": row.get("limit_name", ""),
+                    "location": row.get("location", "global"),
+                    "limit_value": row.get("limit_value"),
+                    "peak_ratio_7d": row.get("peak_ratio_7d"),
+                    "peak_ratio_30d": row.get("peak_ratio_30d"),
+                    "current_ratio": row.get("current_ratio"),
+                    "worst_ratio": round(worst, 4),
+                }
+            )
+    out.sort(key=lambda item: (-item["worst_ratio"], item["project_id"], item["quota_metric"]))
+    return out
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
@@ -187,6 +214,7 @@ def index(
 ) -> HTMLResponse:
     caller = _require_caller(request)
     r = repo()
+    alert_threshold = float(os.environ.get("QMS_ALERT_THRESHOLD", "0.80"))
     try:
         authz_ctx = _resolve_authz(caller, r)
         snap = r.snapshot(
@@ -194,8 +222,11 @@ def index(
             min_ratio=min_ratio,
             allowed_projects=authz_ctx.allowed_projects,
         )
+        alerts = _extract_alerts(snap.get("risk", []), alert_threshold)
         context = {
             **snap,
+            "alerts": alerts,
+            "alert_threshold": alert_threshold,
             "authz": authz_ctx,
             "min_ratio": min_ratio,
             "host_project": r.project,
@@ -211,6 +242,8 @@ def index(
             "hierarchy": [],
             "quality": [],
             "freshness": {},
+            "alerts": [],
+            "alert_threshold": alert_threshold,
             "authz": AuthzContext(
                 email=caller.email,
                 auth_source=caller.auth_source,
@@ -224,6 +257,39 @@ def index(
             "error": str(exc),
         }
     return templates.TemplateResponse(request, "index.html", context)
+
+
+@app.get("/api/alerts")
+def api_alerts(
+    request: Request,
+    threshold: float = Query(0.80, ge=0.0, le=1.0),
+) -> dict:
+    """Return active quota threshold breaches (>= 80% default) for the caller's projects."""
+    caller = _require_caller(request)
+    r = repo()
+    authz_ctx = _resolve_authz(caller, r)
+    try:
+        snap = r.snapshot(
+            limit=2000,
+            min_ratio=0.0,
+            allowed_projects=authz_ctx.allowed_projects,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    alerts = _extract_alerts(snap.get("risk", []), threshold)
+    freshness = snap.get("freshness") or {}
+    collected_at = freshness.get("collected_at")
+    snapshot_iso = (
+        collected_at.isoformat()
+        if hasattr(collected_at, "isoformat")
+        else str(collected_at or "")
+    )
+    return {
+        "snapshot_time": snapshot_iso,
+        "threshold": threshold,
+        "count": len(alerts),
+        "alerts": alerts,
+    }
 
 
 @app.get("/api/history")

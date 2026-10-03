@@ -123,6 +123,8 @@ def enrich_placements(
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
+    from .alerts import DEFAULT_THRESHOLD, emit_alert_summary, evaluate_breaches
+
     projects, placements = resolve_projects(args)
     placements = enrich_placements(projects, placements, billing_project=args.billing_project)
     bundle, definitions = gather(
@@ -131,6 +133,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
     rows = build_rollups(bundle, definitions)
     _LOG.info("built %d rows", len(rows))
     summarise(rows, placements=placements)
+
+    threshold = getattr(args, "alert_threshold", DEFAULT_THRESHOLD)
+    breaches = evaluate_breaches(rows, threshold=threshold)
+    emit_alert_summary(
+        breaches,
+        threshold=threshold,
+        webhook_url=getattr(args, "alert_webhook_url", ""),
+        dashboard_url=os.environ.get("QMS_DASHBOARD_URL", ""),
+    )
 
     if args.dry_run:
         print("\n-- dry run, nothing written --")
@@ -296,6 +307,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="dataset location; cannot be changed after the dataset is created",
     )
     parser.add_argument("--days", type=int, default=30)
+    parser.add_argument(
+        "--alert-threshold",
+        type=float,
+        default=float(os.environ.get("QMS_ALERT_THRESHOLD", "0.80")),
+        help="utilization ratio (0..1) that triggers threshold summary logging / webhooks",
+    )
+    parser.add_argument(
+        "--alert-webhook-url",
+        default=os.environ.get("QMS_ALERT_WEBHOOK_URL", ""),
+        help="optional Slack / Google Chat incoming webhook URL for daily >= threshold digest",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
 
     sub = parser.add_subparsers(dest="command", required=True)
