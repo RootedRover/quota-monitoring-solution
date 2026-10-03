@@ -101,9 +101,11 @@ def build_rollups(
         index,
         accumulators,
         context,
-        accepts=lambda d: d.quota_class is QuotaClass.RATE
-        and d.interval_seconds is not None
-        and d.interval_seconds >= 3600,
+        accepts=lambda d: (
+            d.quota_class is QuotaClass.RATE
+            and d.interval_seconds is not None
+            and d.interval_seconds >= 3600
+        ),
         measured_over=86400,
     )
     _accumulate(
@@ -111,9 +113,11 @@ def build_rollups(
         index,
         accumulators,
         context,
-        accepts=lambda d: d.quota_class is QuotaClass.RATE
-        and d.interval_seconds is not None
-        and d.interval_seconds < 3600,
+        accepts=lambda d: (
+            d.quota_class is QuotaClass.RATE
+            and d.interval_seconds is not None
+            and d.interval_seconds < 3600
+        ),
         measured_over=60,
     )
 
@@ -185,9 +189,7 @@ def _accumulate(
             day = sample.observed_at.astimezone(dt.UTC).date()
             slot = (key, day)
             # Fresh accumulator per bucket per day -- never shared.
-            accumulators.setdefault(slot, _Accumulator()).observe(
-                value, sample.observed_at
-            )
+            accumulators.setdefault(slot, _Accumulator()).observe(value, sample.observed_at)
             context.setdefault(
                 slot,
                 _RowContext(
@@ -234,9 +236,7 @@ def _record_unmatched(
     )
     day = sample.observed_at.astimezone(dt.UTC).date()
     slot = (key, day)
-    accumulators.setdefault(slot, _Accumulator()).observe(
-        sample.value, sample.observed_at
-    )
+    accumulators.setdefault(slot, _Accumulator()).observe(sample.value, sample.observed_at)
     context.setdefault(
         slot,
         _RowContext(

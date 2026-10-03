@@ -1,0 +1,153 @@
+name: CodeMender
+
+# CodeMender is Google's AI code security agent: it scans, then *proves* a
+# finding by building and running a real proof-of-concept exploit, then
+# proposes a patch.
+#
+# It is deliberately NOT wired to every push. Reasons, all from the product's
+# own documentation:
+#
+#   * It is an allowlist-gated Public Preview, billed per Vertex AI token, and
+#     its terms permit testing and evaluation only -- not production use.
+#   * Its docs recommend scanning 10-50 files at a time, not whole repos.
+#   * It executes live exploits, so it needs a disposable sandbox. A
+#     GitHub-hosted ephemeral runner qualifies; a developer workstation
+#     does not.
+#
+# So the fast deterministic gate (ci.yml, codeql.yml, osv-scanner.yml) blocks
+# merges, and CodeMender runs as a deep scan: weekly, on demand, or on a pull
+# request that carries the "codemender" label -- in which case it scans only
+# the files that pull request changed.
+#
+# Until repository variable CODEMENDER_ENABLED is set to "true", every job here
+# no-ops. See security/codemender/README.md for the enablement steps.
+
+on:
+  workflow_dispatch:
+    inputs:
+      paths:
+        description: "Space-separated paths to scan"
+        required: false
+        default: "collector"
+      model:
+        description: "Model to use"
+        required: false
+        default: "gemini-3.7-flash"
+  pull_request:
+    types: [labeled, synchronize]
+  schedule:
+    - cron: "40 3 * * 2"
+
+permissions: {}
+
+concurrency:
+  group: codemender-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          ENABLED: ${{ vars.CODEMENDER_ENABLED }}
+          EVENT: ${{ github.event_name }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if [ "${ENABLED}" != "true" ]; then
+            echo "CODEMENDER_ENABLED is not 'true' -- skipping."
+            echo "See security/codemender/README.md for enablement steps."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On pull requests, only run when explicitly opted in by label, so
+          # that routine PRs do not each incur a token-priced deep scan.
+          if [ "${EVENT}" = "pull_request" ]; then
+            case ",${LABELS}," in
+              *,codemender,*) ;;
+              *) echo "PR is not labelled 'codemender' -- skipping."
+                 echo "enabled=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            esac
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Scan, verify and report
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      # Workload Identity Federation. There is deliberately no service-account
+      # JSON key anywhere in this repository.
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # CodeMender needs history to diff a PR against its base.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Determine scan scope
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_PATHS: ${{ inputs.paths }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${EVENT}" = "pull_request" ]; then
+            # Only what this PR touched. This is both the cheapest and the
+            # most useful scope, and it fits the 10-50 file guidance naturally.
+            mapfile -t CHANGED < <(
+              git diff --name-only --diff-filter=ACMR "${BASE_SHA}" "${HEAD_SHA}" \
+                | grep -E '\.(py|tf|sh|ya?ml)$|Dockerfile' || true
+            )
+            printf '%s\n' "${CHANGED[@]}" | sed '/^$/d' > scope.txt
+          elif [ "${EVENT}" = "workflow_dispatch" ]; then
+            printf '%s\n' ${INPUT_PATHS} > scope.txt
+          else
+            echo "collector" > scope.txt
+          fi
+          echo "count=$(wc -l < scope.txt)" >> "$GITHUB_OUTPUT"
+          echo "--- scan scope ---"; cat scope.txt
+
+      - name: Run CodeMender
+        if: steps.scope.outputs.count != '0'
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          CM_MODEL: ${{ inputs.model || 'gemini-3.7-flash' }}
+          CM_TELEMETRY_OPT_OUT: "1"
+        run: |
+          mapfile -t TARGETS < scope.txt
+          bash security/codemender/scan.sh codemender.sarif "${TARGETS[@]}"
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('codemender.sarif') != ''
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: codemender.sarif
+          category: codemender
+
+      - name: Retain findings
+        if: always() && hashFiles('codemender.sarif') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codemender-sarif
+          path: codemender.sarif
+          retention-days: 30

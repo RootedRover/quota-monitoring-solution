@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 from collections.abc import Iterable
 
 from google.cloud import bigquery
@@ -19,6 +20,10 @@ from ..model import DailyRollup
 _LOG = logging.getLogger(__name__)
 
 TABLE_ID = "quota_daily"
+
+# `project.dataset.table`, where each part is restricted to the characters
+# BigQuery actually permits in an identifier.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2}")
 
 SCHEMA = [
     bigquery.SchemaField("usage_date_utc", "DATE", mode="REQUIRED"),
@@ -108,17 +113,32 @@ class BigQuerySink:
         """Clear partitions before a re-collection so re-runs stay idempotent."""
         if not days:
             return
-        literals = ", ".join(f"DATE '{day.isoformat()}'" for day in days)
-        query = f"DELETE FROM `{self.table_ref}` WHERE usage_date_utc IN ({literals})"
-        self._client.query(query).result()
+        # The only interpolated value is the table reference, which
+        # _validated_table_ref restricts to `project.dataset.table`.
+        # Identifiers cannot be parameterised in BigQuery; the dates can be,
+        # and are.
+        table = self._validated_table_ref()
+        query = f"DELETE FROM `{table}` WHERE usage_date_utc IN UNNEST(@days)"  # noqa: S608
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("days", "DATE", days)]
+        )
+        self._client.query(query, job_config=job_config).result()
+
+    def _validated_table_ref(self) -> str:
+        """BigQuery cannot parameterise identifiers, so validate instead.
+
+        Project, dataset and table names are restricted to letters, digits,
+        underscores and hyphens, which leaves no way to escape the backticks.
+        """
+        if not _IDENTIFIER_RE.fullmatch(self.table_ref):
+            raise ValueError(f"unsafe BigQuery table reference: {self.table_ref!r}")
+        return self.table_ref
 
 
 def _to_json(row: DailyRollup, collected_at: dt.datetime) -> dict:
     return {
         "usage_date_utc": row.usage_date_utc.isoformat(),
-        "usage_date_local": row.usage_date_local.isoformat()
-        if row.usage_date_local
-        else None,
+        "usage_date_local": row.usage_date_local.isoformat() if row.usage_date_local else None,
         "window_boundary": row.window_boundary,
         "collected_at": collected_at.isoformat(),
         "org_id": None,

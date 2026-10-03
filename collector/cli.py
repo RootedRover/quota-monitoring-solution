@@ -29,9 +29,7 @@ _LOG = logging.getLogger("qms")
 
 
 def utc_midnight(offset_days: int = 0) -> dt.datetime:
-    today = dt.datetime.now(dt.UTC).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    today = dt.datetime.now(dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     return today - dt.timedelta(days=offset_days)
 
 
@@ -156,8 +154,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"  quota class     : {row.quota_class.value}")
         print(f"  limit scope     : {row.scope.value}")
         print(
-            f"  interval        : {row.interval_seconds}s "
-            f"(source: {row.interval_source.value})"
+            f"  interval        : {row.interval_seconds}s (source: {row.interval_source.value})"
         )
         print(f"  window boundary : {row.window_boundary}")
         print(f"  date (UTC)      : {row.usage_date_utc}")

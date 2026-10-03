@@ -1,0 +1,39 @@
+name: Scorecard
+
+# Repository posture, not code findings. Deliberately scheduled-only and never
+# a required check: several Scorecard criteria are structurally unsatisfiable
+# on a fork, so gating on it would mean a permanently red branch.
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "30 6 * * 2"
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          sarif_file: results.sarif
+          category: scorecard

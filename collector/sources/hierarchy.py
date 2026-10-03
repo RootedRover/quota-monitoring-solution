@@ -116,4 +116,4 @@ class HierarchySource:
         for raw in self._list("folders", parent, "folders"):
             if raw.get("state") != "ACTIVE":
                 continue
-            self._walk(raw["name"], ancestry + (raw["name"],), org_id, out)
+            self._walk(raw["name"], (*ancestry, raw["name"]), org_id, out)

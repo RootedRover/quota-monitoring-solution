@@ -28,7 +28,9 @@ PROJECT = "proj-a"
 DAY = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
 
 
-def allocation_def(quota_id, metric, *, value, service="svc.googleapis.com", scope=LimitScope.PROJECT):
+def allocation_def(
+    quota_id, metric, *, value, service="svc.googleapis.com", scope=LimitScope.PROJECT
+):
     return QuotaDefinition(
         service=service,
         quota_id=quota_id,

@@ -1,0 +1,41 @@
+name: OSV-Scanner
+
+# OSV-Scanner reads uv.lock directly, which is why this repo keeps a committed
+# lockfile. Dependabot covers the same advisory data but opens PRs rather than
+# gating, so this is the blocking half of dependency security.
+on:
+  pull_request:
+    branches: [main, v6]
+  push:
+    branches: [main, v6]
+  schedule:
+    - cron: "15 5 * * 1"
+
+permissions: {}
+
+jobs:
+  # On pull requests, report only vulnerabilities the PR actually introduces.
+  # Gating on the full set would make every PR fail for pre-existing issues.
+  scan-pr:
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
+
+  scan-full:
+    if: github.event_name != 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+    with:
+      scan-args: |-
+        --recursive
+        ./

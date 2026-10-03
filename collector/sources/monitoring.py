@@ -117,8 +117,7 @@ class MonitoringSource:
             payload = response.json()
         except ValueError as exc:  # pragma: no cover - transport failure
             raise PromQLError(
-                f"non-JSON response ({response.status_code}) from {url}: "
-                f"{response.text[:300]}"
+                f"non-JSON response ({response.status_code}) from {url}: {response.text[:300]}"
             ) from exc
         if payload.get("status") != "success":
             raise PromQLError(
@@ -176,9 +175,7 @@ class MonitoringSource:
             )
         )
 
-    def rate_daily_totals(
-        self, *, start: dt.datetime, end: dt.datetime
-    ) -> list[UsageSample]:
+    def rate_daily_totals(self, *, start: dt.datetime, end: dt.datetime) -> list[UsageSample]:
         return list(
             self._as_samples(
                 self.query_range_daily(Q_RATE_DAILY_TOTAL, start=start, end=end),
@@ -186,9 +183,7 @@ class MonitoringSource:
             )
         )
 
-    def rate_minute_peaks(
-        self, *, start: dt.datetime, end: dt.datetime
-    ) -> list[UsageSample]:
+    def rate_minute_peaks(self, *, start: dt.datetime, end: dt.datetime) -> list[UsageSample]:
         return list(
             self._as_samples(
                 self.query_range_daily(Q_RATE_MINUTE_PEAK, start=start, end=end),

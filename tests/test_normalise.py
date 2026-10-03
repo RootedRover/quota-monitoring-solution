@@ -143,7 +143,11 @@ class TestIsUnlimited:
         ((), "DefaultRequestsPerMinutePerUser", LimitScope.USER),
         (["region"], "A2-CPUS-per-project-region", LimitScope.REGION),
         (["zone"], "A2-CPUS-per-project-zone", LimitScope.ZONE),
-        (["regional_location"], "SearchRequestsPerMinutePerProjectPerRegion", LimitScope.REGION),
+        (
+            ["regional_location"],
+            "SearchRequestsPerMinutePerProjectPerRegion",
+            LimitScope.REGION,
+        ),
         ((), "DefaultPerDayPerProject", LimitScope.PROJECT),
         ((), "ServiceAccountsPerProject", LimitScope.PROJECT),
     ],
@@ -195,9 +199,7 @@ class TestClassifyLimit:
         assert classify_limit(1200, scope=LimitScope.PROJECT) == []
 
     def test_missing(self):
-        assert classify_limit(None, scope=LimitScope.PROJECT) == [
-            DataQualityFlag.LIMIT_MISSING
-        ]
+        assert classify_limit(None, scope=LimitScope.PROJECT) == [DataQualityFlag.LIMIT_MISSING]
 
     def test_unlimited(self):
         assert DataQualityFlag.LIMIT_UNLIMITED in classify_limit(
@@ -210,9 +212,7 @@ class TestClassifyLimit:
         assert DataQualityFlag.LIMIT_NON_POSITIVE not in flags
 
     def test_zero(self):
-        assert DataQualityFlag.LIMIT_NON_POSITIVE in classify_limit(
-            0, scope=LimitScope.PROJECT
-        )
+        assert DataQualityFlag.LIMIT_NON_POSITIVE in classify_limit(0, scope=LimitScope.PROJECT)
 
     def test_per_user_scope_flagged(self):
         assert DataQualityFlag.LIMIT_SCOPE_NOT_COMPARABLE in classify_limit(

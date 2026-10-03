@@ -37,3 +37,14 @@ addopts = "-q --doctest-modules --ignore=collector/sources"
 [tool.ruff]
 line-length = 96
 target-version = "py311"
+
+[tool.ruff.lint]
+# "S" is flake8-bandit, reimplemented natively by Ruff. Running it here costs
+# nothing measurable and removes any need for a separate Bandit pass, which
+# would only report the same findings twice.
+extend-select = ["S", "BLE", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Bare asserts are the entire point of a test.
+"tests/**" = ["S101"]
+

@@ -1,0 +1,40 @@
+version: 2
+updates:
+  # The "uv" ecosystem is what understands uv.lock; "pip" would not.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch bumps arrive as one reviewable PR. Majors stay
+      # ungrouped so each breaking change can be assessed on its own.
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Keeps the SHA pins in .github/workflows current. Dependabot rewrites the
+  # SHA and updates the trailing version comment, so pinning does not mean
+  # going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-all:
+        patterns: ["*"]
+
+  # Both activate when phase P4 lands the Cloud Run image and the rewritten
+  # Terraform module.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "terraform"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+    groups:
+      terraform-providers:
+        patterns: ["*"]

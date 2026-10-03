@@ -117,9 +117,7 @@ class CloudQuotasSource:
     ) -> dict[str, QuotaDefinition]:
         return {d.quota_id: d for d in self.list_quota_infos(container, service)}
 
-    def iter_all(
-        self, container: str, services: list[str]
-    ) -> Iterator[QuotaDefinition]:
+    def iter_all(self, container: str, services: list[str]) -> Iterator[QuotaDefinition]:
         for service in services:
             yield from self.list_quota_infos(container, service)
 
