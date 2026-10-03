@@ -69,73 +69,263 @@ tests/                # Golden-file and unit test suite (pytest, 108 tests)
 
 ## 4. Deployment Guide
 
-See [`terraform/README.md`](terraform/README.md) for the complete infrastructure reference and IAM table.
+This guide walks you through deploying QMS v6 from start to finish using standard terminal commands—no prior Google Cloud experience, local Docker daemon, or AI coding assistant is required.
 
-### 4.1 Prerequisites
+For a deeper architectural breakdown of the Terraform resources and least-privilege IAM bindings, see [`terraform/README.md`](terraform/README.md).
 
-* **Host Project**: A Google Cloud project to host BigQuery, Artifact Registry, Cloud Scheduler, and the two Cloud Run workloads.
-* **Target Organization**: Organization ID (e.g., `957650833838`) to scan.
-* **Tools**: `gcloud` CLI, `terraform >= 1.5`, and `uv` (for local development/testing).
-* **Permissions to deploy**:
-  * Project Owner (or Editor + Project IAM Admin + Run Admin + Service Account Admin) on the **Host Project**.
-  * Organization IAM Admin on the **Target Organization** to grant read-only viewer roles (`roles/monitoring.viewer`, `roles/cloudquotas.viewer`, `roles/browser`, `roles/cloudasset.viewer`, `roles/iam.securityReviewer`) to the collector and dashboard service accounts.
+---
 
-### 4.2 Deploy with Terraform & Cloud Build
+### 4.1 Before You Begin (Key Google Cloud Concepts & Prerequisites)
+
+If you are migrating from AWS, Azure, or on-premises infrastructure, QMS uses two core Google Cloud hierarchy concepts:
+
+1. **Google Cloud Organization (`ORG_ID`)** *(similar to an AWS Organizations Root or Azure Tenant)*:
+   The top-level root node of your company's Google Cloud resources. It is identified by a **numeric ID** (for example, `123456789012`), not your domain name. QMS scans quota usage across all active projects inside this Organization.
+2. **Host Project (`PROJECT_ID`)** *(similar to a dedicated AWS Account or Azure Subscription)*:
+   A single Google Cloud project (with billing enabled) where QMS deploys its own components: the BigQuery dataset (`quota_monitoring`), the Artifact Registry container repository (`qms`), the daily collector (`qms-collector` Cloud Run Job), the web UI (`qms-dashboard` Cloud Run Service), and the daily cron trigger (`qms-daily-collect` Cloud Scheduler job). Every project has a globally unique **Project ID** slug (for example, `my-company-qms-host`).
+
+#### Where to Run These Commands
+
+* **Option A — Google Cloud Shell (Recommended for first-time GCP users):**
+  Open the [Google Cloud Console](https://console.cloud.google.com/) in your browser and click the **Activate Cloud Shell (`>_`)** icon in the top-right navigation bar. Cloud Shell is a free browser-based terminal that comes **pre-installed with `git`, `gcloud`, and `terraform`**—nothing needs to be installed on your computer.
+* **Option B — Your Local Workstation:**
+  If you prefer running from your own machine, install:
+  * [Google Cloud CLI (`gcloud`)](https://cloud.google.com/sdk/docs/install)
+  * [Terraform (`>= 1.5`)](https://developer.hashicorp.com/terraform/install)
+  * `git`
+
+#### Required Permissions to Deploy
+
+The Google account you sign in with needs permissions on both the **Host Project** (to create the infrastructure) and the **Organization** (to grant read-only quota/monitoring viewer roles to the QMS service accounts):
+
+* **On the Host Project (`PROJECT_ID`):** `Project Owner` (`roles/owner`), **or** `Editor` (`roles/editor`) + `Project IAM Admin` (`roles/resourcemanager.projectIamAdmin`) + `Cloud Run Admin` (`roles/run.admin`) + `Service Account Admin` (`roles/iam.serviceAccountAdmin`).
+* **On the Organization (`ORG_ID`):**
+  * `Organization IAM Admin` (`roles/resourcemanager.organizationAdmin`) — allows Terraform to bind read-only viewer roles (`roles/monitoring.viewer`, `roles/cloudquotas.viewer`, `roles/browser`, `roles/cloudasset.viewer`, `roles/iam.securityReviewer`) to the QMS service accounts.
+  * `Cloud Quotas Viewer` (`roles/cloudquotas.viewer`) — allows your own user account to view organization-wide quotas once you open the dashboard.
+
+<details>
+<summary><strong>Need an administrator to grant you these roles first? (Click to expand commands)</strong></summary>
+
+Ask an existing Organization Administrator to run the following commands, replacing the email, project ID, and organization ID with yours:
 
 ```bash
-# 1. Authenticate with Google Cloud
+# Grant Project Owner on the Host Project
+gcloud projects add-iam-policy-binding YOUR_HOST_PROJECT_ID \
+  --member="user:YOUR_EMAIL@example.com" \
+  --role="roles/owner"
+
+# Grant Organization IAM Admin and Cloud Quotas Viewer at the Organization level
+gcloud organizations add-iam-policy-binding YOUR_ORG_ID \
+  --member="user:YOUR_EMAIL@example.com" \
+  --role="roles/resourcemanager.organizationAdmin"
+
+gcloud organizations add-iam-policy-binding YOUR_ORG_ID \
+  --member="user:YOUR_EMAIL@example.com" \
+  --role="roles/cloudquotas.viewer"
+```
+</details>
+
+---
+
+### 4.2 Step-by-Step Deployment
+
+#### Step 1: Authenticate with Google Cloud
+
+Run the following commands to sign in with your Google Cloud account and provide credentials for Terraform:
+
+```bash
+# 1. Sign in to the gcloud CLI (in Cloud Shell, this just confirms your active session)
 gcloud auth login
+
+# 2. Sign in for Terraform (Application Default Credentials)
 gcloud auth application-default login
-gcloud config set project <HOST_PROJECT_ID>
+```
 
-# 2. Configure Terraform variables
-cd terraform/example
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your project_id, organization_id, region, and dashboard_invokers
+*(Each command opens a browser link or prompt—sign in with your Google Cloud email and approve access.)*
 
-# 3. Phase 1: Provision APIs, Artifact Registry, staging bucket, and build service account
-terraform init
-terraform apply \
+---
+
+#### Step 2: Look Up Your IDs & Set Environment Variables
+
+If you do not already know your numeric **Organization ID** or **Host Project ID**, list them with:
+
+```bash
+# List your Organization(s) — copy the numeric value in the ID column
+gcloud organizations list
+
+# List your Projects — copy the slug in the PROJECT_ID column for your host project
+gcloud projects list
+```
+
+Now set the four variables below in your terminal. **Every command in Steps 3–7 uses these variables automatically**, so you only need to fill them in once right here:
+
+```bash
+export PROJECT_ID="your-host-project-id"          # e.g., my-qms-host-project
+export ORG_ID="123456789012"                      # Numeric ID from `gcloud organizations list`
+export REGION="asia-south1"                       # e.g., us-central1, europe-west1, asia-south1
+export ADMIN_EMAIL="you@example.com"              # Your Google Cloud sign-in email
+
+# Set your active gcloud project
+gcloud config set project "$PROJECT_ID"
+```
+
+---
+
+#### Step 3: Clone the Repository & Create `terraform.tfvars`
+
+Clone the repository and generate your `terraform/example/terraform.tfvars` configuration file from the variables you exported in Step 2:
+
+```bash
+git clone https://github.com/RootedRover/quota-monitoring-solution.git
+cd quota-monitoring-solution
+
+cat <<EOF > terraform/example/terraform.tfvars
+project_id      = "${PROJECT_ID}"
+organization_id = "${ORG_ID}"
+region          = "${REGION}"
+
+image = "${REGION}-docker.pkg.dev/${PROJECT_ID}/qms/qms:v6"
+
+# Users or Google Groups allowed to open the dashboard URL via Identity-Aware Proxy (IAP).
+# Use "user:email@domain.com" for individuals or "group:team@domain.com" for Google Groups.
+dashboard_invokers = [
+  "user:${ADMIN_EMAIL}",
+]
+
+collection_schedule = "30 2 * * *"
+schedule_time_zone  = "Etc/UTC"
+EOF
+```
+
+> **Tip:** Run `cat terraform/example/terraform.tfvars` to double-check that none of the values are blank before continuing.
+
+---
+
+#### Step 4: Bootstrap Build Infrastructure (Terraform Phase 1)
+
+Cloud Run requires the container image to exist in Artifact Registry before creating the job and dashboard service. In this step, Terraform enables the required Google Cloud APIs and creates the Artifact Registry repository, the Cloud Build source staging bucket, and the dedicated `qms-build` service account:
+
+```bash
+terraform -chdir=terraform/example init
+
+terraform -chdir=terraform/example apply \
   -target=module.qms.google_project_service.this \
   -target=module.qms.google_artifact_registry_repository.qms \
   -target=module.qms.google_storage_bucket.build_source \
   -target=module.qms.google_service_account.build \
-  -target=module.qms.google_artifact_registry_repository_iam_member.build_writer \
-  -target=module.qms.google_storage_bucket_iam_member.build_source_admin \
-  -target=module.qms.google_project_iam_member.build_log_writer
-
-# 4. Phase 2: Build and push the container image via Cloud Build
-cd ../..
-gcloud builds submit \
-  --region=<REGION> \
-  --config=cloudbuild.yaml \
-  --gcs-source-staging-dir=gs://<HOST_PROJECT_ID>-qms-build-source/source \
-  --service-account=projects/<HOST_PROJECT_ID>/serviceAccounts/qms-build@<HOST_PROJECT_ID>.iam.gserviceaccount.com \
-  --project=<HOST_PROJECT_ID>
-
-# 5. Phase 3: Provision BigQuery dataset, Cloud Run Job & Service (with Direct IAP), and Scheduler
-cd terraform/example
-terraform apply
+  -target=module.qms.google_artifact_registry_repository_iam_member.build_pushes \
+  -target=module.qms.google_storage_bucket_iam_member.build_reads_source \
+  -target=module.qms.google_project_iam_member.build_logs
 ```
 
-### 4.3 Create Views & Run Initial 30-Day Backfill
+When Terraform prints `Do you want to perform these actions?`, type **`yes`** and press **Enter**.
+
+---
+
+#### Step 5: Build & Push the Container Image in Cloud Build
+
+Next, submit the repository to **Google Cloud Build**, which builds the Docker image remotely in Google Cloud (no local Docker installation required) and pushes it to your Artifact Registry repository:
 
 ```bash
-# Create or replace the 6 BigQuery views
-uv run python -m collector.cli \
-  --billing-project <HOST_PROJECT_ID> \
-  --dataset quota_monitoring \
-  --bq-location <REGION> \
-  views
-
-# Execute the collector job (or run a 30-day backfill)
-gcloud run jobs execute qms-collector --region=<REGION> --project=<HOST_PROJECT_ID> --wait
+gcloud builds submit \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --config=cloudbuild.yaml \
+  --gcs-source-staging-dir="gs://${PROJECT_ID}-qms-build-source/source" \
+  --service-account="projects/${PROJECT_ID}/serviceAccounts/qms-build@${PROJECT_ID}.iam.gserviceaccount.com" \
+  .
 ```
 
-### 4.4 Granting Dashboard Access to Users
+Wait \~1–2 minutes for the build to finish with `STATUS: SUCCESS`.
 
-1. **IAP Access to the Cloud Run Service**: Grant `roles/iap.httpsResourceAccessor` on `qms-dashboard` to the users or Google Groups who should be able to open the dashboard URL.
-2. **Workload Quota Visibility**: Each signed-in user automatically sees only the projects where they hold `roles/cloudquotas.viewer` (or a custom role containing `cloudquotas.quotaInfos.list`) at the **Organization**, **Folder**, or **Project** level.
+---
+
+#### Step 6: Deploy BigQuery, Cloud Run Workloads & Scheduler (Terraform Phase 2)
+
+Now that the container image is in Artifact Registry, run a full `terraform apply` to provision the `quota_monitoring` BigQuery dataset, the `qms-collector` Cloud Run Job, the `qms-dashboard` Cloud Run Service (with Direct Cloud Run IAP enabled), and the `qms-daily-collect` Cloud Scheduler job:
+
+```bash
+terraform -chdir=terraform/example apply
+```
+
+Type **`yes`** and press **Enter** when prompted. When complete, Terraform will print your live `dashboard_url`.
+
+---
+
+#### Step 7: Create BigQuery Views & Run Your First Quota Collection
+
+Finally, trigger the `qms-collector` Cloud Run Job to create the 6 BigQuery views (`quota_latest`, `quota_peaks`, `quota_risk`, `quota_movers`, `quota_hierarchy`, `quota_quality`) and run your first quota collection sweep across your Organization (this runs entirely on Cloud Run—no local Python setup required):
+
+```bash
+# 1. Create the 6 partition-pruned BigQuery views
+gcloud run jobs execute qms-collector \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --args="-m,collector.cli,views" \
+  --wait
+
+# 2. Run an initial 30-day backfill + collection so 7d and 30d peaks are populated immediately
+gcloud run jobs execute qms-collector \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --args="-m,collector.cli,--days,30,collect" \
+  --wait
+```
+
+*(After this initial 30-day backfill, Cloud Scheduler will automatically run the default 7-day rolling collection every night at `02:30`.)*
+
+---
+
+### 4.3 Opening the Dashboard & Granting Access to Teammates
+
+#### Open the Dashboard in Your Browser
+
+Print your live dashboard URL and open it in your browser:
+
+```bash
+terraform -chdir=terraform/example output -raw dashboard_url && echo
+```
+
+Because **Direct Cloud Run IAP** is enabled, opening that URL in your browser automatically signs you in with your Google corporate identity—no local proxy tunnel is needed.
+
+#### Granting Dashboard Access to Additional Users or Teams
+
+QMS enforces a **two-layer security model** so different teams can safely share a single dashboard URL while only seeing the projects they are authorized to view:
+
+1. **Layer 1 — Who Can Open the Dashboard URL (Identity-Aware Proxy):**
+   Add the user (`"user:alice@example.com"`) or Google Group (`"group:cloud-platform@example.com"`) to `dashboard_invokers` in `terraform/example/terraform.tfvars`, then re-run `terraform -chdir=terraform/example apply`.
+2. **Layer 2 — Which Projects Each User Sees Inside the Dashboard (Row-Level IAM):**
+   The dashboard automatically checks which projects the signed-in user has permission to inspect (`cloudquotas.quotaInfos.list`, included in the standard **`roles/cloudquotas.viewer`** role).
+   * **To let a user see all projects in the Organization:**
+     ```bash
+     gcloud organizations add-iam-policy-binding "$ORG_ID" \
+       --member="user:alice@example.com" \
+       --role="roles/cloudquotas.viewer"
+     ```
+   * **To let a user see only projects inside a specific Folder:**
+     ```bash
+     gcloud resource-manager folders add-iam-policy-binding FOLDER_ID \
+       --member="user:alice@example.com" \
+       --role="roles/cloudquotas.viewer"
+     ```
+   * **To let a user see only a single Project:**
+     ```bash
+     gcloud projects add-iam-policy-binding TARGET_PROJECT_ID \
+       --member="user:alice@example.com" \
+       --role="roles/cloudquotas.viewer"
+     ```
+
+---
+
+### 4.4 Troubleshooting & Updating
+
+| Symptom | Cause & Fix |
+| --- | --- |
+| **Browser shows `403 Forbidden` / IAP access screen when opening `dashboard_url`** | 1. Ensure your email or Google Group is listed in `dashboard_invokers` in `terraform/example/terraform.tfvars` and run `terraform -chdir=terraform/example apply`.<br>2. If you just ran `terraform apply`, wait \~1–2 minutes for IAM policy propagation and refresh the browser tab. |
+| **Dashboard loads, but shows `0 projects in your scope (Access Restricted)`** | You have IAP access to open the web app, but your user account does not yet hold `roles/cloudquotas.viewer` on any monitored project, folder, or organization. Grant `roles/cloudquotas.viewer` using one of the commands in [Section 4.3](#43-opening-the-dashboard--granting-access-to-teammates). |
+| **`terraform apply` fails with `Error 403` on `google_organization_iam_member`** | Your account needs `roles/resourcemanager.organizationAdmin` at the Organization level (`$ORG_ID`) so Terraform can bind read-only viewer roles to `qms-collector` and `qms-dashboard`. See the expandable admin commands in [Section 4.1](#41-before-you-begin-key-google-cloud-concepts--prerequisites). |
+| **`gcloud builds submit` fails with `Permission 'storage.objects.get' denied`** | Ensure you completed **Step 4** (`terraform apply -target=...`) so the `${PROJECT_ID}-qms-build-source` bucket and `qms-build` IAM binding exist, and make sure `--gcs-source-staging-dir="gs://${PROJECT_ID}-qms-build-source/source"` is included in your `gcloud builds submit` command. |
+| **How do I update the running app after pulling new code?** | 1. Run `git pull`<br>2. Re-run the `gcloud builds submit` command from **Step 5**<br>3. Run:<br>`gcloud run services update qms-dashboard --project="$PROJECT_ID" --region="$REGION" --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/qms/qms:v6"`<br>`gcloud run jobs update qms-collector --project="$PROJECT_ID" --region="$REGION" --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/qms/qms:v6"` |
 
 ---
 

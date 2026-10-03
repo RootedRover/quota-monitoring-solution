@@ -85,7 +85,7 @@ cd terraform/example
 # Phase 1 -- APIs, repository, bucket, accounts.
 terraform init
 terraform apply \
-  -target=module.qms.google_project_service.apis \
+  -target=module.qms.google_project_service.this \
   -target=module.qms.google_artifact_registry_repository.qms \
   -target=module.qms.google_storage_bucket.build_source \
   -target=module.qms.google_service_account.build \
