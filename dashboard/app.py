@@ -12,11 +12,14 @@ write path to anything.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
@@ -26,8 +29,6 @@ _LOG = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
-app = FastAPI(title="Quota Monitoring", docs_url=None, redoc_url=None)
 
 _repo: Repository | None = None
 
@@ -45,27 +46,47 @@ def repo() -> Repository:
     return _repo
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Warm the BigQuery cache in a background thread as soon as the worker starts."""
+    if os.environ.get("QMS_PROJECT"):
+        try:
+            repo().warm_async()
+        except Exception:  # noqa: BLE001
+            _LOG.warning("could not schedule startup cache warm-up", exc_info=True)
+    yield
+
+
+app = FastAPI(
+    title="Quota Monitoring",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=_lifespan,
+)
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
 def _pct(value: float | None) -> str:
     if value is None:
-        return "--"
+        return "—"
     return f"{value * 100:.1f}%"
 
 
 def _num(value) -> str:
     if value is None:
-        return "--"
+        return "—"
     try:
         number = float(value)
     except (TypeError, ValueError):
         return str(value)
     if number >= 1e18:
-        return "unlimited"
+        return "Unlimited"
     if number >= 1_000_000:
         return f"{number / 1_000_000:.1f}M"
     if number >= 1_000:
         return f"{number / 1_000:.1f}k"
     if number.is_integer():
-        return str(int(number))
+        return f"{int(number):,}"
     return f"{number:.2f}"
 
 
@@ -74,13 +95,15 @@ templates.env.filters["num"] = _num
 templates.env.globals["severity"] = severity
 
 
+@app.get("/livez")
 @app.get("/healthz")
 def healthz() -> dict:
     """Liveness only -- deliberately does not touch BigQuery.
 
     Cloud Run's health check should answer "is the process serving?", not "is
     the warehouse up?". Conflating the two turns a BigQuery blip into a restart
-    loop.
+    loop. ``/livez`` is the primary route because Google's ``*.run.app`` edge
+    intercepts ``/healthz`` on external requests.
     """
     return {"status": "ok"}
 
@@ -98,18 +121,16 @@ def readyz() -> JSONResponse:
 def index(
     request: Request,
     min_ratio: float = Query(0.0, ge=0.0, le=1.0),
-    limit: int = Query(200, ge=1, le=1000),
+    limit: int = Query(500, ge=1, le=2000),
 ) -> HTMLResponse:
     r = repo()
     try:
+        snap = r.snapshot(limit=limit, min_ratio=min_ratio)
         context = {
-            "summary": r.summary(),
-            "risk": r.risk(limit=limit, min_ratio=min_ratio),
-            "movers": r.movers(),
-            "hierarchy": r.hierarchy(),
-            "quality": r.quality(),
-            "freshness": r.freshness(),
+            **snap,
             "min_ratio": min_ratio,
+            "host_project": r.project,
+            "dataset": r.dataset,
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 - render the failure, don't 500
@@ -122,6 +143,8 @@ def index(
             "quality": [],
             "freshness": {},
             "min_ratio": min_ratio,
+            "host_project": os.environ.get("QMS_PROJECT", ""),
+            "dataset": os.environ.get("QMS_DATASET", "quota_monitoring"),
             "error": str(exc),
         }
     return templates.TemplateResponse(request, "index.html", context)
@@ -158,18 +181,41 @@ def quality_detail(flag: str) -> dict:
 
 @app.post("/api/refresh")
 def refresh() -> dict:
-    """Drop the cache. Does not re-collect -- that is the job's business."""
+    """Drop the cache and trigger a fresh parallel snapshot."""
     clear_cache()
+    if os.environ.get("QMS_PROJECT"):
+        repo().warm_async()
     return {"status": "cleared"}
 
 
 def main() -> None:
+    import argparse
+
     import uvicorn
+
+    from . import queries as qmod
+
+    parser = argparse.ArgumentParser(description="Run the QMS dashboard service.")
+    parser.add_argument("--project", default=os.environ.get("QMS_PROJECT", ""))
+    parser.add_argument("--dataset", default=os.environ.get("QMS_DATASET", "quota_monitoring"))
+    parser.add_argument("--bq-location", default=os.environ.get("QMS_BQ_LOCATION", "US"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    args = parser.parse_args()
+
+    if args.project:
+        os.environ["QMS_PROJECT"] = args.project
+        qmod.PROJECT = args.project
+    if args.dataset:
+        os.environ["QMS_DATASET"] = args.dataset
+        qmod.DATASET = args.dataset
+    if args.bq_location:
+        os.environ["QMS_BQ_LOCATION"] = args.bq_location
+        qmod.LOCATION = args.bq_location
 
     uvicorn.run(
         app,
         host="0.0.0.0",  # noqa: S104 - Cloud Run requires binding all interfaces
-        port=int(os.environ.get("PORT", "8080")),
+        port=args.port,
         log_level=os.environ.get("QMS_LOG_LEVEL", "info"),
     )
 

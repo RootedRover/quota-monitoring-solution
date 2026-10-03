@@ -1,292 +1,749 @@
 {% extends "base.html" %}
 
-{% macro badge(ratio) -%}
+{% macro pct_meter(ratio) -%}
   {%- set sev = severity(ratio) -%}
-  <span class="inline-block px-2 py-0.5 rounded text-xs font-medium
-    {% if sev == 'critical' %}bg-red-100 text-red-800
-    {% elif sev == 'warning' %}bg-orange-100 text-orange-800
-    {% elif sev == 'elevated' %}bg-yellow-100 text-yellow-800
-    {% elif sev == 'ok' %}bg-green-100 text-green-800
-    {% else %}bg-gray-100 text-gray-600{% endif %}">
-    {{ ratio | pct }}
-  </span>
+  {%- set pct_val = 0 if ratio is none else (ratio * 100) -%}
+  {%- set bar_w = 100 if pct_val > 100 else (0 if pct_val < 0 else pct_val) -%}
+  <div class="pct-cell">
+    {% if ratio is not none %}
+    <div class="pct-bar-track" aria-hidden="true">
+      <div class="pct-bar-fill"
+           style="width: {{ '%.1f' % bar_w }}%; background: var(--sev-{{ sev }}-bar);"></div>
+    </div>
+    {% endif %}
+    <span class="sev-badge sev-{{ sev }}">{{ ratio | pct }}</span>
+  </div>
+{%- endmacro %}
+
+{% macro sev_pill(ratio) -%}
+  {%- set sev = severity(ratio) -%}
+  <span class="sev-badge sev-{{ sev }}">{{ ratio | pct }}</span>
 {%- endmacro %}
 
 {% block content %}
 
-<!-- ------------------------------------------------------------- summary -->
-<div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-5">
-  {% set cards = [
-      ('Quotas tracked', summary.get('tracked', 0), 'text-gray-900'),
-      ('Critical (>=90%)', summary.get('critical', 0), 'text-red-700'),
-      ('Warning (80-90%)', summary.get('warning', 0), 'text-orange-600'),
-      ('Projects', summary.get('projects', 0), 'text-gray-900'),
-      ('Services', summary.get('services', 0), 'text-gray-900'),
-      ('Not comparable', summary.get('excluded', 0), 'text-gray-500'),
-  ] %}
-  {% for label, value, colour in cards %}
-    <div class="bg-white border border-gray-200 rounded p-3">
-      <div class="text-xs text-gray-500">{{ label }}</div>
-      <div class="text-2xl font-semibold {{ colour }}">{{ value }}</div>
+<!-- ------------------------------------------------------------- KPI strip -->
+<div class="kpi-grid">
+  <div class="kpi-card interactive" id="kpi-all" onclick="setMinRatio(0)">
+    <div class="kpi-label">
+      <span>Quotas Tracked</span>
+      <span style="color: var(--brand-blue); font-size: 10px;">Comparable</span>
     </div>
-  {% endfor %}
+    <div class="kpi-value">{{ "{:,}".format(summary.get('tracked', 0)) }}</div>
+    <div class="kpi-sub">Click to show all</div>
+  </div>
+
+  <div class="kpi-card interactive" id="kpi-critical" onclick="setMinRatio(0.9)">
+    <div class="kpi-label">
+      <span>Critical (&ge; 90%)</span>
+      <span style="width:8px;height:8px;border-radius:50%;background:var(--sev-critical-bar);"></span>
+    </div>
+    <div class="kpi-value" style="color: var(--sev-critical-text);">{{ "{:,}".format(summary.get('critical', 0)) }}</div>
+    <div class="kpi-sub">30-day peak &ge; 90%</div>
+  </div>
+
+  <div class="kpi-card interactive" id="kpi-warning" onclick="setMinRatio(0.8)">
+    <div class="kpi-label">
+      <span>Warning (80–90%)</span>
+      <span style="width:8px;height:8px;border-radius:50%;background:var(--sev-warning-bar);"></span>
+    </div>
+    <div class="kpi-value" style="color: var(--sev-warning-text);">{{ "{:,}".format(summary.get('warning', 0)) }}</div>
+    <div class="kpi-sub">Click to filter &ge; 80%</div>
+  </div>
+
+  <div class="kpi-card">
+    <div class="kpi-label"><span>Active Projects</span></div>
+    <div class="kpi-value">{{ "{:,}".format(summary.get('projects', 0)) }}</div>
+    <div class="kpi-sub">With comparable quotas</div>
+  </div>
+
+  <div class="kpi-card">
+    <div class="kpi-label"><span>GCP Services</span></div>
+    <div class="kpi-value">{{ "{:,}".format(summary.get('services', 0)) }}</div>
+    <div class="kpi-sub">Emitting usage metrics</div>
+  </div>
+
+  <div class="kpi-card interactive" onclick="showTab('quality')">
+    <div class="kpi-label"><span>Filtered / Flagged</span></div>
+    <div class="kpi-value" style="color: var(--text-secondary);">{{ "{:,}".format(summary.get('excluded', 0)) }}</div>
+    <div class="kpi-sub">Inspect in Data Quality &rarr;</div>
+  </div>
 </div>
 
-<!-- ---------------------------------------------------------------- tabs -->
-<div class="border-b border-gray-200 mb-4">
-  <nav class="flex gap-6 text-sm">
-    {% for key, label in [
-        ('risk', 'Risk'), ('movers', 'Movers'),
-        ('hierarchy', 'Hierarchy'), ('quality', 'Data quality')] %}
-      <button data-tab="{{ key }}" onclick="showTab('{{ key }}')"
-              class="tab-button pb-2 border-b-2 border-transparent text-gray-500
-                     hover:text-gray-900">{{ label }}</button>
-    {% endfor %}
-  </nav>
+<!-- ------------------------------------------------------------------ tabs -->
+<div class="console-tabs" role="tablist">
+  <button data-tab="risk" onclick="showTab('risk')" class="tab-btn active" id="tab-btn-risk">
+    <span>Quota Utilization &amp; Risk</span>
+    <span class="tab-count" id="tab-count-risk">{{ risk | length }}</span>
+  </button>
+  <button data-tab="movers" onclick="showTab('movers')" class="tab-btn" id="tab-btn-movers">
+    <span>7d Movers</span>
+    <span class="tab-count">{{ movers | length }}</span>
+  </button>
+  <button data-tab="hierarchy" onclick="showTab('hierarchy')" class="tab-btn" id="tab-btn-hierarchy">
+    <span>Org &amp; Folder Hierarchy</span>
+    <span class="tab-count">{{ hierarchy | length }}</span>
+  </button>
+  <button data-tab="quality" onclick="showTab('quality')" class="tab-btn" id="tab-btn-quality">
+    <span>Data Quality &amp; Guardrails</span>
+    <span class="tab-count">{{ quality | length }}</span>
+  </button>
 </div>
 
-<!-- ---------------------------------------------------------------- risk -->
+<!-- =============================================================== TAB: RISK -->
 <section id="tab-risk" class="tab-panel">
-  <div class="flex items-center gap-3 mb-3">
-    <input id="filter" type="search" placeholder="Filter by project, service, metric or limit…"
-           oninput="filterTable()"
-           class="w-96 px-3 py-1.5 border border-gray-300 rounded text-sm">
-    <form method="get" class="flex items-center gap-2 text-xs text-gray-600">
-      <label for="min_ratio">min 30d peak</label>
-      <select id="min_ratio" name="min_ratio" onchange="this.form.submit()"
-              class="border border-gray-300 rounded px-2 py-1">
-        {% for value, label in [(0.0,'any'),(0.5,'50%'),(0.8,'80%'),(0.9,'90%')] %}
-          <option value="{{ value }}" {% if min_ratio == value %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
-    </form>
-    <span class="text-xs text-gray-500 ml-auto" id="row-count">{{ risk | length }} quotas</span>
+  <!-- Searchable Dropdown Filter Toolbar -->
+  <div class="filter-toolbar" id="risk-filter-bar">
+    <span class="filter-group-label">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+      </svg>
+      Filter
+    </span>
+
+    <!-- 1. Project Searchable Dropdown -->
+    <div class="dd-root" id="dd-project">
+      <button type="button" class="dd-trigger" onclick="toggleDropdown('project', event)" id="dd-btn-project">
+        <span class="dd-trigger-key">Project:</span>
+        <span class="dd-trigger-val" id="dd-val-project">All</span>
+        <span class="dd-clear-inline hidden" id="dd-clr-project" onclick="clearFacet('project', event)" title="Clear project filter">&times;</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="dd-menu" id="dd-menu-project" onclick="event.stopPropagation()">
+        <div class="dd-search-wrap">
+          <input type="text" class="dd-search" id="dd-search-project"
+                 placeholder="Search project ID…" oninput="renderDropdownList('project')">
+        </div>
+        <div class="dd-list" id="dd-list-project"></div>
+      </div>
+    </div>
+
+    <!-- 2. Service Searchable Dropdown -->
+    <div class="dd-root" id="dd-service">
+      <button type="button" class="dd-trigger" onclick="toggleDropdown('service', event)" id="dd-btn-service">
+        <span class="dd-trigger-key">Service:</span>
+        <span class="dd-trigger-val" id="dd-val-service">All</span>
+        <span class="dd-clear-inline hidden" id="dd-clr-service" onclick="clearFacet('service', event)" title="Clear service filter">&times;</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="dd-menu" id="dd-menu-service" onclick="event.stopPropagation()">
+        <div class="dd-search-wrap">
+          <input type="text" class="dd-search" id="dd-search-service"
+                 placeholder="Search service (e.g. compute, aiplatform)…" oninput="renderDropdownList('service')">
+        </div>
+        <div class="dd-list" id="dd-list-service"></div>
+      </div>
+    </div>
+
+    <!-- 3. Quota Metric Searchable Dropdown -->
+    <div class="dd-root" id="dd-metric">
+      <button type="button" class="dd-trigger" onclick="toggleDropdown('metric', event)" id="dd-btn-metric">
+        <span class="dd-trigger-key">Quota Metric:</span>
+        <span class="dd-trigger-val" id="dd-val-metric">All</span>
+        <span class="dd-clear-inline hidden" id="dd-clr-metric" onclick="clearFacet('metric', event)" title="Clear quota metric filter">&times;</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="dd-menu" id="dd-menu-metric" onclick="event.stopPropagation()" style="width: 400px;">
+        <div class="dd-search-wrap">
+          <input type="text" class="dd-search" id="dd-search-metric"
+                 placeholder="Search quota metric…" oninput="renderDropdownList('metric')">
+        </div>
+        <div class="dd-list" id="dd-list-metric"></div>
+      </div>
+    </div>
+
+    <!-- 4. Instant Min-Peak Segmented Filter -->
+    <div class="segmented-group" role="group" aria-label="Minimum 30-day peak threshold">
+      <button type="button" class="seg-btn active" data-min="0" onclick="setMinRatio(0)">All</button>
+      <button type="button" class="seg-btn" data-min="0.5" onclick="setMinRatio(0.5)">&ge; 50%</button>
+      <button type="button" class="seg-btn" data-min="0.8" onclick="setMinRatio(0.8)">&ge; 80%</button>
+      <button type="button" class="seg-btn" data-min="0.9" onclick="setMinRatio(0.9)">&ge; 90%</button>
+    </div>
+
+    <!-- 5. Quick Keyword Search across Location / Limit Type -->
+    <input id="quick-search" type="search" class="quick-search-input"
+           placeholder="Search location or limit type…"
+           oninput="applyFilters()">
+
+    <button type="button" id="btn-reset-all" class="btn-reset-filters hidden" onclick="resetAllFilters()">
+      Reset all
+    </button>
+
+    <div class="toolbar-right">
+      <span id="row-count" class="tabular">Showing <strong>{{ risk | length }}</strong> of {{ risk | length }} quotas</span>
+    </div>
   </div>
 
-  <div class="bg-white border border-gray-200 rounded overflow-auto" style="max-height:70vh">
-    <table class="w-full text-xs sticky-head">
-      <thead class="bg-gray-100 text-gray-600 text-left">
-        <tr>
-          <th class="px-3 py-2 font-medium">Project</th>
-          <th class="px-3 py-2 font-medium">Service</th>
-          <th class="px-3 py-2 font-medium">Quota metric</th>
-          <th class="px-3 py-2 font-medium">Limit</th>
-          <th class="px-3 py-2 font-medium">Location</th>
-          <th class="px-3 py-2 font-medium text-right">Peak 7d</th>
-          <th class="px-3 py-2 font-medium text-right">Peak 30d</th>
-          <th class="px-3 py-2 font-medium text-right">Peak usage</th>
-          <th class="px-3 py-2 font-medium text-right">Limit value</th>
-          <th class="px-3 py-2 font-medium text-right">Headroom</th>
-        </tr>
-      </thead>
-      <tbody id="risk-body" class="divide-y divide-gray-100">
-        {% for row in risk %}
-          <tr class="row-link"
-              data-search="{{ (row.project_id ~ ' ' ~ row.service ~ ' ' ~ row.quota_metric ~ ' ' ~ (row.limit_name or '')) | lower }}"
-              onclick="openDrawer(this)"
-              data-project="{{ row.project_id }}"
-              data-service="{{ row.service }}"
-              data-metric="{{ row.quota_metric }}"
-              data-limit="{{ row.limit_name or '' }}"
-              data-location="{{ row.location }}">
-            <td class="px-3 py-1.5 whitespace-nowrap">{{ row.project_id }}</td>
-            <td class="px-3 py-1.5 whitespace-nowrap text-gray-600">
-              {{ row.service.split('.')[0] }}</td>
-            <td class="px-3 py-1.5">{{ row.quota_metric }}</td>
-            <td class="px-3 py-1.5 text-gray-600">{{ row.limit_name or '—' }}</td>
-            <td class="px-3 py-1.5 text-gray-500">{{ row.location }}</td>
-            <td class="px-3 py-1.5 text-right">{{ badge(row.peak_ratio_7d) }}</td>
-            <td class="px-3 py-1.5 text-right">{{ badge(row.peak_ratio_30d) }}</td>
-            <td class="px-3 py-1.5 text-right tabular-nums">{{ row.peak_usage_30d | num }}</td>
-            <td class="px-3 py-1.5 text-right tabular-nums">
-              {% if row.is_unlimited %}
-                <span class="text-gray-400">unlimited</span>
-              {% else %}{{ row.limit_value | num }}{% endif %}
-            </td>
-            <td class="px-3 py-1.5 text-right tabular-nums text-gray-600">
-              {% if row.is_unlimited %}—{% else %}{{ row.headroom_30d | num }}{% endif %}
-            </td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% if not risk %}
-      <p class="p-6 text-center text-gray-500">
-        No comparable quotas yet. Run a collection first.</p>
-    {% endif %}
-  </div>
-</section>
-
-<!-- -------------------------------------------------------------- movers -->
-<section id="tab-movers" class="tab-panel hidden">
-  <p class="text-xs text-gray-500 mb-3">
-    Quotas whose last 7 days are materially busier than the preceding three
-    weeks. Rows below a 5% peak are excluded: a jump from 0.01% to 0.02% is a
-    doubling and means nothing.
-  </p>
-  <div class="bg-white border border-gray-200 rounded overflow-auto">
-    <table class="w-full text-xs">
-      <thead class="bg-gray-100 text-gray-600 text-left">
-        <tr>
-          <th class="px-3 py-2 font-medium">Project</th>
-          <th class="px-3 py-2 font-medium">Quota metric</th>
-          <th class="px-3 py-2 font-medium">Limit</th>
-          <th class="px-3 py-2 font-medium text-right">Baseline</th>
-          <th class="px-3 py-2 font-medium text-right">Last 7d</th>
-          <th class="px-3 py-2 font-medium text-right">Change</th>
-        </tr>
-      </thead>
-      <tbody class="divide-y divide-gray-100">
-        {% for row in movers %}
+  <!-- Risk Data Table (9 Requested Columns) -->
+  <div class="table-card">
+    <div class="table-scroll">
+      <table class="console-table" id="risk-table">
+        <colgroup>
+          <col style="width: 12%;">
+          <col style="width: 8%;">
+          <col style="width: 22%;">
+          <col style="width: 8%;">
+          <col style="width: 18%;">
+          <col style="width: 8%;">
+          <col style="width: 6%;">
+          <col style="width: 9%;">
+          <col style="width: 9%;">
+        </colgroup>
+        <thead>
           <tr>
-            <td class="px-3 py-1.5">{{ row.project_id }}</td>
-            <td class="px-3 py-1.5">{{ row.quota_metric }}</td>
-            <td class="px-3 py-1.5 text-gray-600">{{ row.limit_name or '—' }}</td>
-            <td class="px-3 py-1.5 text-right">{{ row.baseline | pct }}</td>
-            <td class="px-3 py-1.5 text-right">{{ badge(row.recent) }}</td>
-            <td class="px-3 py-1.5 text-right font-medium
-                {% if row.delta > 0 %}text-red-700{% else %}text-green-700{% endif %}">
-              {{ '%+.1f' % (row.delta * 100) }} pp
-            </td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% if not movers %}
-      <p class="p-6 text-center text-gray-500">
-        Nothing moved materially. Needs at least 28 days of history.</p>
-    {% endif %}
-  </div>
-</section>
-
-<!-- ----------------------------------------------------------- hierarchy -->
-<section id="tab-hierarchy" class="tab-panel hidden">
-  <p class="text-xs text-gray-500 mb-3">
-    Counts rather than averages: the mean of a set of quota ratios is not a
-    meaningful quantity, but the number of quotas above a threshold is.
-  </p>
-  <div class="bg-white border border-gray-200 rounded overflow-auto">
-    <table class="w-full text-xs">
-      <thead class="bg-gray-100 text-gray-600 text-left">
-        <tr>
-          <th class="px-3 py-2 font-medium">Organisation</th>
-          <th class="px-3 py-2 font-medium">Folder</th>
-          <th class="px-3 py-2 font-medium">Project</th>
-          <th class="px-3 py-2 font-medium text-right">Tracked</th>
-          <th class="px-3 py-2 font-medium text-right">Critical</th>
-          <th class="px-3 py-2 font-medium text-right">Warning</th>
-          <th class="px-3 py-2 font-medium text-right">Worst 30d</th>
-        </tr>
-      </thead>
-      <tbody class="divide-y divide-gray-100">
-        {% for row in hierarchy %}
-          <tr>
-            <td class="px-3 py-1.5 text-gray-600">{{ row.org_id or '—' }}</td>
-            <td class="px-3 py-1.5 text-gray-600">{{ row.folder_id or '—' }}</td>
-            <td class="px-3 py-1.5">{{ row.project_id }}</td>
-            <td class="px-3 py-1.5 text-right tabular-nums">{{ row.quotas_tracked }}</td>
-            <td class="px-3 py-1.5 text-right tabular-nums
-                {% if row.critical_30d %}text-red-700 font-medium{% endif %}">
-              {{ row.critical_30d }}</td>
-            <td class="px-3 py-1.5 text-right tabular-nums
-                {% if row.warning_30d %}text-orange-600 font-medium{% endif %}">
-              {{ row.warning_30d }}</td>
-            <td class="px-3 py-1.5 text-right">{{ badge(row.worst_30d) }}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</section>
-
-<!-- ------------------------------------------------------------- quality -->
-<section id="tab-quality" class="tab-panel hidden">
-  <p class="text-xs text-gray-500 mb-3">
-    Why rows are or are not charted. A dashboard that silently drops part of
-    its input is worse than one that shows you what it dropped — this panel is
-    the reason the other three can be trusted.
-  </p>
-  <div class="grid md:grid-cols-2 gap-4">
-    <div class="bg-white border border-gray-200 rounded overflow-hidden">
-      <table class="w-full text-xs">
-        <thead class="bg-gray-100 text-gray-600 text-left">
-          <tr>
-            <th class="px-3 py-2 font-medium">Flag</th>
-            <th class="px-3 py-2 font-medium text-right">Rows</th>
-            <th class="px-3 py-2 font-medium text-right">Quotas</th>
+            <th class="sortable" data-col="0" data-type="str" onclick="sortRiskTable(0, 'str')">
+              Project <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable" data-col="1" data-type="str" onclick="sortRiskTable(1, 'str')">
+              Service <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable" data-col="2" data-type="str" onclick="sortRiskTable(2, 'str')">
+              Quota Metric <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable" data-col="3" data-type="str" onclick="sortRiskTable(3, 'str')">
+              Location <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable" data-col="4" data-type="str" onclick="sortRiskTable(4, 'str')">
+              Limit Type <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable num-col" data-col="5" data-type="num" onclick="sortRiskTable(5, 'num')">
+              Current Limit <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable num-col" data-col="6" data-type="num" onclick="sortRiskTable(6, 'num')">
+              7d Peak <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable num-col" data-col="7" data-type="num" onclick="sortRiskTable(7, 'num')">
+              7d Peak (%) <span class="sort-indicator">&#8597;</span>
+            </th>
+            <th class="sortable num-col sorted" data-col="8" data-type="num" onclick="sortRiskTable(8, 'num')">
+              30d Peak (%) <span class="sort-indicator">&#9660;</span>
+            </th>
           </tr>
         </thead>
-        <tbody class="divide-y divide-gray-100">
-          {% for row in quality %}
-            <tr class="row-link" onclick="loadQuality('{{ row.flag }}')">
-              <td class="px-3 py-1.5 font-mono">{{ row.flag }}</td>
-              <td class="px-3 py-1.5 text-right tabular-nums">{{ row.row_count }}</td>
-              <td class="px-3 py-1.5 text-right tabular-nums">{{ row.quota_count }}</td>
+        <tbody id="risk-body">
+          {% for row in risk %}
+            {% set svc_short = row.service.split('.')[0] if row.service else '' %}
+            {% set metric_short = row.quota_metric.split('/', 1)[1] if (row.quota_metric and '/' in row.quota_metric) else (row.quota_metric or '') %}
+            <tr class="clickable-row"
+                onclick="openDrawer(this)"
+                data-project="{{ row.project_id }}"
+                data-service="{{ row.service }}"
+                data-service-short="{{ svc_short }}"
+                data-metric="{{ row.quota_metric }}"
+                data-limit="{{ row.limit_name or '' }}"
+                data-location="{{ row.location }}"
+                data-ratio30="{{ row.peak_ratio_30d if row.peak_ratio_30d is not none else -1 }}"
+                data-ratio7="{{ row.peak_ratio_7d if row.peak_ratio_7d is not none else -1 }}"
+                data-peak7="{{ row.peak_usage_7d if row.peak_usage_7d is not none else -1 }}"
+                data-limitval="{{ 999999999999999999 if row.is_unlimited else (row.limit_value if row.limit_value is not none else -1) }}"
+                data-search="{{ (row.project_id ~ ' ' ~ row.service ~ ' ' ~ row.quota_metric ~ ' ' ~ (row.limit_name or '') ~ ' ' ~ (row.location or '') ~ ' ' ~ (row.quota_class or '')) | lower }}">
+              <!-- 1. Project -->
+              <td class="cell-project mono" data-sort="{{ row.project_id }}">{{ row.project_id }}</td>
+
+              <!-- 2. Service -->
+              <td data-sort="{{ row.service }}">
+                <div class="cell-service-main" title="{{ row.service }}">{{ svc_short }}</div>
+              </td>
+
+              <!-- 3. Quota Metric -->
+              <td data-sort="{{ metric_short }}">
+                <div class="cell-metric-main mono" title="{{ row.quota_metric }}">{{ metric_short }}</div>
+              </td>
+
+              <!-- 4. Location -->
+              <td data-sort="{{ row.location }}">
+                <span class="loc-chip">{{ row.location or 'global' }}</span>
+              </td>
+
+              <!-- 5. Limit Type -->
+              <td data-sort="{{ row.limit_name or '' }}">
+                <div class="limit-type-main mono">{{ row.limit_name or '—' }}</div>
+              </td>
+
+              <!-- 6. Current Limit -->
+              <td class="num-col tabular mono" data-sort="{{ 999999999999999999 if row.is_unlimited else (row.limit_value if row.limit_value is not none else -1) }}">
+                {% if row.is_unlimited %}
+                  <span class="loc-chip" style="color: var(--text-muted);">Unlimited</span>
+                {% else %}
+                  {{ row.limit_value | num }}
+                {% endif %}
+              </td>
+
+              <!-- 7. 7d Peak (numeric value) -->
+              <td class="num-col tabular mono" data-sort="{{ row.peak_usage_7d if row.peak_usage_7d is not none else -1 }}">
+                {{ row.peak_usage_7d | num }}
+              </td>
+
+              <!-- 8. 7d Peak (%) -->
+              <td class="num-col tabular" data-sort="{{ row.peak_ratio_7d if row.peak_ratio_7d is not none else -1 }}">
+                {{ pct_meter(row.peak_ratio_7d) }}
+              </td>
+
+              <!-- 9. 30d Peak (%) -->
+              <td class="num-col tabular" data-sort="{{ row.peak_ratio_30d if row.peak_ratio_30d is not none else -1 }}">
+                {{ pct_meter(row.peak_ratio_30d) }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if not risk %}
+        <div class="dd-empty" style="padding: 36px;">
+          No comparable quotas found. Run a collection job first.
+        </div>
+      {% endif %}
+      <div id="risk-no-matches" class="dd-empty hidden" style="padding: 36px;">
+        No quotas match the selected filters. <button type="button" class="btn-reset-filters" onclick="resetAllFilters()">Reset filters</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================= TAB: MOVERS -->
+<section id="tab-movers" class="tab-panel hidden">
+  <div class="filter-toolbar" style="justify-content: space-between;">
+    <span style="color: var(--text-secondary);">
+      Quotas whose recent 7-day peak materially exceeds their preceding 21-day baseline (filtered to &ge; 5% utilization to suppress low-base noise).
+    </span>
+  </div>
+  <div class="table-card">
+    <div class="table-scroll">
+      <table class="console-table">
+        <thead>
+          <tr>
+            <th>Project</th>
+            <th>Service</th>
+            <th>Quota Metric</th>
+            <th>Location</th>
+            <th>Limit Type</th>
+            <th class="num-col">Prior 21d Baseline</th>
+            <th class="num-col">Last 7d Peak (%)</th>
+            <th class="num-col">Delta</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in movers %}
+            {% set m_svc_short = row.service.split('.')[0] if row.service else '' %}
+            {% set m_metric_short = row.quota_metric.split('/', 1)[1] if (row.quota_metric and '/' in row.quota_metric) else (row.quota_metric or '') %}
+            <tr>
+              <td class="cell-project mono">{{ row.project_id }}</td>
+              <td class="cell-service-main" title="{{ row.service }}">{{ m_svc_short }}</td>
+              <td class="cell-metric-main mono" title="{{ row.quota_metric }}">{{ m_metric_short }}</td>
+              <td><span class="loc-chip">{{ row.location or 'global' }}</span></td>
+              <td class="limit-type-main mono">{{ row.limit_name or '—' }}</td>
+              <td class="num-col tabular">{{ row.baseline | pct }}</td>
+              <td class="num-col tabular">{{ pct_meter(row.recent) }}</td>
+              <td class="num-col tabular mono" style="font-weight: 600; color: {% if row.delta > 0 %}var(--sev-critical-text){% else %}var(--sev-ok-text){% endif %};">
+                {{ '%+.1f' % (row.delta * 100) }} pp
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if not movers %}
+        <div class="dd-empty" style="padding: 36px;">
+          No material movers detected (&ge; 5% utilization with 28-day baseline).
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<!-- ========================================================== TAB: HIERARCHY -->
+<section id="tab-hierarchy" class="tab-panel hidden">
+  <div class="filter-toolbar">
+    <span style="color: var(--text-secondary);">
+      Organization, Folder, and Project posture rollup — threshold counts and worst 30-day peak per node.
+    </span>
+  </div>
+  <div class="table-card">
+    <div class="table-scroll">
+      <table class="console-table">
+        <thead>
+          <tr>
+            <th>Organization ID</th>
+            <th>Folder ID</th>
+            <th>Project</th>
+            <th class="num-col">Comparable Quotas</th>
+            <th class="num-col">Critical (&ge; 90%)</th>
+            <th class="num-col">Warning (80–90%)</th>
+            <th class="num-col">Worst 30d Peak (%)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in hierarchy %}
+            <tr class="clickable-row" onclick="jumpToProject('{{ row.project_id }}')" title="Click to filter Risk table to {{ row.project_id }}">
+              <td class="mono" style="color: var(--text-secondary);">{{ row.org_id or '—' }}</td>
+              <td class="mono" style="color: var(--text-secondary);">{{ row.folder_id or '—' }}</td>
+              <td class="cell-project mono">{{ row.project_id }}</td>
+              <td class="num-col tabular mono">{{ row.quotas_tracked }}</td>
+              <td class="num-col tabular mono" style="{% if row.critical_30d %}color: var(--sev-critical-text); font-weight: 700;{% endif %}">
+                {{ row.critical_30d }}
+              </td>
+              <td class="num-col tabular mono" style="{% if row.warning_30d %}color: var(--sev-warning-text); font-weight: 700;{% endif %}">
+                {{ row.warning_30d }}
+              </td>
+              <td class="num-col tabular">{{ pct_meter(row.worst_30d) }}</td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
-    <div class="bg-white border border-gray-200 rounded p-3">
-      <h3 class="font-medium mb-2" id="quality-title">Select a flag</h3>
-      <div id="quality-detail" class="text-xs text-gray-600 overflow-auto"
-           style="max-height:50vh"></div>
+  </div>
+</section>
+
+<!-- ============================================================ TAB: QUALITY -->
+<section id="tab-quality" class="tab-panel hidden">
+  <div class="filter-toolbar">
+    <span style="color: var(--text-secondary);">
+      Data quality telemetry &amp; comparability guardrails. Click any flag to inspect the affected quota buckets.
+    </span>
+  </div>
+  <div style="display: grid; grid-template-columns: minmax(340px, 1fr) 2fr; gap: 16px;">
+    <div class="table-card">
+      <table class="console-table">
+        <thead>
+          <tr>
+            <th>Guardrail Flag</th>
+            <th>Status</th>
+            <th class="num-col">Daily Rows</th>
+            <th class="num-col">Quotas</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in quality %}
+            <tr class="clickable-row" onclick="loadQuality('{{ row.flag }}')">
+              <td class="mono" style="font-weight: 600;">{{ row.flag }}</td>
+              <td>
+                {% if row.flag == 'OK' or row.is_comparable %}
+                  <span class="sev-badge sev-ok" style="min-width: auto;">Charted</span>
+                {% else %}
+                  <span class="sev-badge sev-unknown" style="min-width: auto;">Withheld</span>
+                {% endif %}
+              </td>
+              <td class="num-col tabular mono">{{ "{:,}".format(row.row_count or 0) }}</td>
+              <td class="num-col tabular mono">{{ "{:,}".format(row.quota_count or 0) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="table-card" style="padding: 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <h3 id="quality-title" style="margin: 0; font-size: 14px; font-weight: 600;">Select a flag on the left to inspect rows</h3>
+      </div>
+      <div id="quality-detail" class="table-scroll" style="max-height: 55vh; min-height: 200px; color: var(--text-secondary);">
+        <p style="margin: 0; color: var(--text-muted);">Click any guardrail flag row to load the distinct quota buckets carrying that flag.</p>
+      </div>
     </div>
   </div>
 </section>
 
-<!-- -------------------------------------------------------------- drawer -->
-<div id="drawer"
-     class="drawer hidden-right fixed top-0 right-0 h-full w-full max-w-2xl bg-white
-            border-l border-gray-300 shadow-xl z-50 overflow-auto">
-  <div class="p-5">
-    <div class="flex items-start">
-      <div>
-        <h2 id="drawer-title" class="text-base font-semibold"></h2>
-        <p id="drawer-subtitle" class="text-xs text-gray-500 mt-1"></p>
-      </div>
-      <button onclick="closeDrawer()"
-              class="ml-auto text-gray-400 hover:text-gray-900 text-xl leading-none">&times;</button>
+<!-- ========================================================= DETAIL DRAWER -->
+<div id="scrim" class="drawer-scrim" onclick="closeDrawer()"></div>
+<aside id="drawer" class="drawer-panel" aria-label="Quota 30-day history">
+  <div class="drawer-header">
+    <div>
+      <div id="drawer-title" class="mono" style="font-size: 14px; font-weight: 600; color: var(--text-primary);"></div>
+      <div id="drawer-subtitle" class="mono" style="font-size: 11.5px; color: var(--text-secondary); margin-top: 4px;"></div>
     </div>
-    <div class="mt-5" style="height:260px"><canvas id="drawer-chart"></canvas></div>
-    <div id="drawer-table" class="mt-5"></div>
+    <button class="drawer-close" onclick="closeDrawer()" title="Close (Esc)">&times;</button>
   </div>
-</div>
-<div id="scrim" onclick="closeDrawer()"
-     class="fixed inset-0 bg-black/20 z-40 hidden"></div>
+  <div class="drawer-body">
+    <div style="height: 250px; background: #f8fafc; border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px;">
+      <canvas id="drawer-chart"></canvas>
+    </div>
+    <div id="drawer-table" style="margin-top: 18px;"></div>
+  </div>
+</aside>
 
 {% endblock %}
 
 {% block scripts %}
 <script>
-  // ------------------------------------------------------------------ tabs
+  // --------------------------------------------------------- Filter State
+  const state = {
+    project: '',
+    service: '',
+    metric: '',
+    minRatio: {{ min_ratio or 0 }},
+    quickSearch: '',
+    openMenu: null,
+    sortCol: 8,
+    sortAsc: false,
+  };
+
+  function shortMetric(val) {
+    if (!val) return '';
+    const idx = val.indexOf('/');
+    return idx !== -1 ? val.slice(idx + 1) : val;
+  }
+
+  function shortService(val) {
+    if (!val) return '';
+    return val.split('.')[0];
+  }
+
+  // Pre-index table rows once on load (< 1ms for hundreds of rows).
+  const riskRows = Array.from(document.querySelectorAll('#risk-body tr')).map(tr => ({
+    el: tr,
+    project: tr.dataset.project || '',
+    service: tr.dataset.service || '',
+    serviceShort: tr.dataset.serviceShort || '',
+    metric: tr.dataset.metric || '',
+    limit: tr.dataset.limit || '',
+    location: tr.dataset.location || '',
+    ratio30: parseFloat(tr.dataset.ratio30 || '-1'),
+    search: tr.dataset.search || '',
+  }));
+
+  // ------------------------------------------------------------------ Tabs
   function showTab(name) {
     document.querySelectorAll('.tab-panel').forEach(el => el.classList.add('hidden'));
-    document.getElementById('tab-' + name).classList.remove('hidden');
-    document.querySelectorAll('.tab-button').forEach(el => {
-      const active = el.dataset.tab === name;
-      el.classList.toggle('border-blue-600', active);
-      el.classList.toggle('text-gray-900', active);
-      el.classList.toggle('font-medium', active);
-      el.classList.toggle('text-gray-500', !active);
-      el.classList.toggle('border-transparent', !active);
+    const target = document.getElementById('tab-' + name);
+    if (target) target.classList.remove('hidden');
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.tab === name);
     });
-    location.hash = name;
+    history.replaceState(null, '', '#' + name);
   }
 
-  // ---------------------------------------------------------------- filter
-  function filterTable() {
-    const needle = document.getElementById('filter').value.toLowerCase();
+  function jumpToProject(projectId) {
+    state.project = projectId;
+    showTab('risk');
+    applyFilters();
+  }
+
+  // ------------------------------------------------ Searchable Dropdowns
+  function toggleDropdown(facet, ev) {
+    ev.stopPropagation();
+    const isSame = state.openMenu === facet;
+    closeAllDropdowns();
+    if (!isSame) {
+      state.openMenu = facet;
+      const menu = document.getElementById('dd-menu-' + facet);
+      const input = document.getElementById('dd-search-' + facet);
+      if (menu) menu.classList.add('open');
+      renderDropdownList(facet);
+      if (input) {
+        input.value = '';
+        renderDropdownList(facet);
+        setTimeout(() => input.focus(), 10);
+      }
+    }
+  }
+
+  function closeAllDropdowns() {
+    state.openMenu = null;
+    document.querySelectorAll('.dd-menu').forEach(m => m.classList.remove('open'));
+  }
+
+  document.addEventListener('click', () => closeAllDropdowns());
+
+  function facetOptions(facet) {
+    // Cascading counts: count how many rows match the OTHER active filters.
+    const counts = new Map();
+    for (const r of riskRows) {
+      if (facet !== 'project' && state.project && r.project !== state.project) continue;
+      if (facet !== 'service' && state.service && r.service !== state.service) continue;
+      if (facet !== 'metric' && state.metric && r.metric !== state.metric) continue;
+      if (state.minRatio > 0 && r.ratio30 < state.minRatio) continue;
+      const val = r[facet];
+      if (!val) continue;
+      counts.set(val, (counts.get(val) || 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b) => {
+      const dispA = facet === 'metric' ? shortMetric(a[0]) : a[0];
+      const dispB = facet === 'metric' ? shortMetric(b[0]) : b[0];
+      return dispA.localeCompare(dispB);
+    });
+  }
+
+  function renderDropdownList(facet) {
+    const listEl = document.getElementById('dd-list-' + facet);
+    const searchEl = document.getElementById('dd-search-' + facet);
+    if (!listEl) return;
+    const needle = (searchEl ? searchEl.value : '').trim().toLowerCase();
+    const options = facetOptions(facet);
+    const filtered = needle
+      ? options.filter(([val]) => val.toLowerCase().includes(needle))
+      : options;
+
+    const totalCount = options.reduce((acc, [, c]) => acc + c, 0);
+    let html = '';
+
+    if (!needle) {
+      const allSelected = !state[facet] ? 'selected' : '';
+      html += `
+        <div class="dd-item ${allSelected}" onclick="selectFacet('${facet}', '')">
+          <span class="dd-item-label">All ${facet === 'metric' ? 'quota metrics' : facet + 's'}</span>
+          <span class="dd-item-count">${totalCount}</span>
+        </div>`;
+    }
+
+    if (filtered.length === 0) {
+      html += `<div class="dd-empty">No matching ${facet}s</div>`;
+    } else {
+      for (const [val, count] of filtered) {
+        const sel = state[facet] === val ? 'selected' : '';
+        const escaped = val.replace(/'/g, "\\'");
+        const label = facet === 'metric' ? shortMetric(val) : (facet === 'service' ? shortService(val) : val);
+        html += `
+          <div class="dd-item ${sel}" onclick="selectFacet('${facet}', '${escaped}')">
+            <span class="dd-item-label mono" title="${val}">${label}</span>
+            <span class="dd-item-count">${count}</span>
+          </div>`;
+      }
+    }
+    listEl.innerHTML = html;
+  }
+
+  function selectFacet(facet, value) {
+    state[facet] = value;
+    closeAllDropdowns();
+    applyFilters();
+  }
+
+  function clearFacet(facet, ev) {
+    ev.stopPropagation();
+    state[facet] = '';
+    closeAllDropdowns();
+    applyFilters();
+  }
+
+  function setMinRatio(val) {
+    state.minRatio = val;
+    applyFilters();
+  }
+
+  function resetAllFilters() {
+    state.project = '';
+    state.service = '';
+    state.metric = '';
+    state.minRatio = 0;
+    state.quickSearch = '';
+    const qs = document.getElementById('quick-search');
+    if (qs) qs.value = '';
+    applyFilters();
+  }
+
+  function updateFilterUI(shownCount) {
+    for (const facet of ['project', 'service', 'metric']) {
+      const val = state[facet];
+      const btn = document.getElementById('dd-btn-' + facet);
+      const valSpan = document.getElementById('dd-val-' + facet);
+      const clr = document.getElementById('dd-clr-' + facet);
+      if (btn) btn.classList.toggle('has-value', Boolean(val));
+      if (valSpan) {
+        if (!val) {
+          valSpan.textContent = 'All';
+        } else if (facet === 'metric') {
+          valSpan.textContent = shortMetric(val);
+          valSpan.title = val;
+        } else if (facet === 'service') {
+          valSpan.textContent = shortService(val);
+          valSpan.title = val;
+        } else {
+          valSpan.textContent = val;
+          valSpan.title = val;
+        }
+      }
+      if (clr) clr.classList.toggle('hidden', !val);
+    }
+
+    document.querySelectorAll('.seg-btn').forEach(btn => {
+      const m = parseFloat(btn.dataset.min || '0');
+      btn.classList.toggle('active', Math.abs(m - state.minRatio) < 0.001);
+    });
+
+    const kpiAll = document.getElementById('kpi-all');
+    const kpiCrit = document.getElementById('kpi-critical');
+    const kpiWarn = document.getElementById('kpi-warning');
+    if (kpiAll) kpiAll.classList.toggle('active-card', state.minRatio === 0 && (state.project || state.service || state.metric));
+    if (kpiCrit) kpiCrit.classList.toggle('active-card', Math.abs(state.minRatio - 0.9) < 0.001);
+    if (kpiWarn) kpiWarn.classList.toggle('active-card', Math.abs(state.minRatio - 0.8) < 0.001);
+
+    const anyActive = Boolean(
+      state.project || state.service || state.metric || state.minRatio > 0 || state.quickSearch
+    );
+    const resetBtn = document.getElementById('btn-reset-all');
+    if (resetBtn) resetBtn.classList.toggle('hidden', !anyActive);
+
+    const rowCount = document.getElementById('row-count');
+    if (rowCount) {
+      rowCount.innerHTML = `Showing <strong>${shownCount}</strong> of ${riskRows.length} quotas`;
+    }
+    const noMatches = document.getElementById('risk-no-matches');
+    if (noMatches && riskRows.length > 0) {
+      noMatches.classList.toggle('hidden', shownCount > 0);
+    }
+  }
+
+  function applyFilters() {
+    const qs = document.getElementById('quick-search');
+    state.quickSearch = (qs ? qs.value : '').trim().toLowerCase();
+
     let shown = 0;
-    document.querySelectorAll('#risk-body tr').forEach(tr => {
-      const hit = !needle || tr.dataset.search.includes(needle);
-      tr.classList.toggle('hidden', !hit);
+    for (const r of riskRows) {
+      const matchProj = !state.project || r.project === state.project;
+      const matchSvc = !state.service || r.service === state.service;
+      const matchMet = !state.metric || r.metric === state.metric;
+      const matchRatio = state.minRatio <= 0 || r.ratio30 >= state.minRatio;
+      const matchQuick = !state.quickSearch || r.search.includes(state.quickSearch);
+
+      const hit = matchProj && matchSvc && matchMet && matchRatio && matchQuick;
+      r.el.classList.toggle('hidden', !hit);
       if (hit) shown++;
-    });
-    document.getElementById('row-count').textContent = shown + ' quotas';
+    }
+    updateFilterUI(shown);
   }
 
-  // ---------------------------------------------------------------- drawer
+  // -------------------------------------------------------- Column Sorting
+  function sortRiskTable(colIdx, type) {
+    if (state.sortCol === colIdx) {
+      state.sortAsc = !state.sortAsc;
+    } else {
+      state.sortCol = colIdx;
+      state.sortAsc = type === 'str';
+    }
+
+    const tbody = document.getElementById('risk-body');
+    const dir = state.sortAsc ? 1 : -1;
+
+    riskRows.sort((a, b) => {
+      const cellA = a.el.children[colIdx];
+      const cellB = b.el.children[colIdx];
+      const rawA = cellA ? (cellA.dataset.sort ?? cellA.textContent.trim()) : '';
+      const rawB = cellB ? (cellB.dataset.sort ?? cellB.textContent.trim()) : '';
+      if (type === 'num') {
+        const numA = parseFloat(rawA);
+        const numB = parseFloat(rawB);
+        return (numA - numB) * dir;
+      }
+      return rawA.localeCompare(rawB) * dir;
+    });
+
+    const frag = document.createDocumentFragment();
+    for (const r of riskRows) {
+      frag.appendChild(r.el);
+    }
+    tbody.appendChild(frag);
+
+    document.querySelectorAll('#risk-table thead th.sortable').forEach(th => {
+      const c = parseInt(th.dataset.col, 10);
+      const ind = th.querySelector('.sort-indicator');
+      if (c === colIdx) {
+        th.classList.add('sorted');
+        if (ind) ind.innerHTML = state.sortAsc ? '&#9650;' : '&#9660;';
+      } else {
+        th.classList.remove('sorted');
+        if (ind) ind.innerHTML = '&#8597;';
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- Drawer
   let chart = null;
 
   async function openDrawer(tr) {
@@ -297,17 +754,17 @@
       limit_name: tr.dataset.limit,
       location:   tr.dataset.location,
     });
-    document.getElementById('drawer-title').textContent = tr.dataset.metric;
+    document.getElementById('drawer-title').textContent = shortMetric(tr.dataset.metric);
     document.getElementById('drawer-subtitle').textContent =
-      `${tr.dataset.project} · ${tr.dataset.limit || 'no limit name'} · ${tr.dataset.location}`;
-    document.getElementById('drawer').classList.remove('hidden-right');
-    document.getElementById('scrim').classList.remove('hidden');
+      `${tr.dataset.project} · ${shortService(tr.dataset.service)} · ${tr.dataset.limit || 'default'} · ${tr.dataset.location}`;
+    document.getElementById('drawer').classList.add('open');
+    document.getElementById('scrim').classList.add('open');
 
     const res = await fetch('/api/history?' + q);
     const { series } = await res.json();
 
     const labels = series.map(p => p.usage_date_utc);
-    const peak   = series.map(p => p.peak_ratio === null ? null : p.peak_ratio * 100);
+    const peak   = series.map(p => p.peak_ratio === null ? null : +(p.peak_ratio * 100).toFixed(2));
 
     if (chart) chart.destroy();
     chart = new Chart(document.getElementById('drawer-chart'), {
@@ -315,73 +772,103 @@
       data: {
         labels,
         datasets: [{
-          label: 'Daily peak consumption (%)',
+          label: 'Daily peak utilization (%)',
           data: peak,
           borderColor: '#1a73e8',
-          backgroundColor: 'rgba(26,115,232,0.1)',
+          backgroundColor: 'rgba(26, 115, 232, 0.10)',
+          borderWidth: 2,
           fill: true,
-          tension: 0.2,
+          tension: 0.22,
           spanGaps: true,
-          pointRadius: 2,
+          pointRadius: 2.5,
         }]
       },
       options: {
-        responsive: true, maintainAspectRatio: false,
+        responsive: true,
+        maintainAspectRatio: false,
         scales: {
-          // Not pinned to 100: clipping the axis would hide exactly the
-          // pathological values this rewrite exists to surface.
-          y: { beginAtZero: true, ticks: { callback: v => v + '%' } }
+          y: {
+            beginAtZero: true,
+            ticks: { callback: v => v + '%' },
+            grid: { color: '#e2e8f0' }
+          },
+          x: {
+            grid: { display: false }
+          }
         },
         plugins: { legend: { display: false } }
       }
     });
 
-    const rows = series.slice().reverse().slice(0, 15).map(p => `
-      <tr class="border-t border-gray-100">
-        <td class="py-1 pr-3">${p.usage_date_utc}</td>
-        <td class="py-1 pr-3 text-right tabular-nums">${p.daily_peak_usage ?? '—'}</td>
-        <td class="py-1 pr-3 text-right tabular-nums">${p.limit_value ?? '—'}</td>
-        <td class="py-1 pr-3 text-right">${p.peak_ratio === null ? '—' : (p.peak_ratio*100).toFixed(2) + '%'}</td>
-        <td class="py-1 text-gray-500">${(p.flags || []).join(', ')}</td>
+    const rows = series.slice().reverse().slice(0, 20).map(p => `
+      <tr>
+        <td class="mono">${p.usage_date_utc}</td>
+        <td class="num-col tabular mono">${p.daily_peak_usage ?? '—'}</td>
+        <td class="num-col tabular mono">${p.limit_value ?? '—'}</td>
+        <td class="num-col tabular mono">${p.peak_ratio === null ? '—' : (p.peak_ratio * 100).toFixed(2) + '%'}</td>
+        <td class="mono" style="color: var(--text-muted);">${(p.flags || []).join(', ') || 'OK'}</td>
       </tr>`).join('');
     document.getElementById('drawer-table').innerHTML = `
-      <table class="w-full text-xs">
-        <thead class="text-gray-500 text-left">
-          <tr><th class="pb-1">Date</th><th class="pb-1 text-right">Peak usage</th>
-              <th class="pb-1 text-right">Limit</th><th class="pb-1 text-right">Ratio</th>
-              <th class="pb-1">Flags</th></tr>
-        </thead><tbody>${rows}</tbody>
-      </table>`;
+      <div class="table-card">
+        <table class="console-table">
+          <thead>
+            <tr>
+              <th>Date (UTC)</th>
+              <th class="num-col">Daily Peak Usage</th>
+              <th class="num-col">Current Limit</th>
+              <th class="num-col">Peak (%)</th>
+              <th>Flags</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
   }
 
   function closeDrawer() {
-    document.getElementById('drawer').classList.add('hidden-right');
-    document.getElementById('scrim').classList.add('hidden');
+    document.getElementById('drawer').classList.remove('open');
+    document.getElementById('scrim').classList.remove('open');
   }
 
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      closeAllDropdowns();
+      closeDrawer();
+    }
+  });
 
-  // --------------------------------------------------------------- quality
+  // --------------------------------------------------------------- Quality
   async function loadQuality(flag) {
-    document.getElementById('quality-title').textContent = flag;
+    document.getElementById('quality-title').textContent = `Flag: ${flag}`;
     const res = await fetch('/api/quality/' + encodeURIComponent(flag));
     const { rows } = await res.json();
     document.getElementById('quality-detail').innerHTML = rows.length ? `
-      <table class="w-full">
-        <thead class="text-gray-500 text-left">
-          <tr><th class="pb-1">Project</th><th class="pb-1">Quota metric</th>
-              <th class="pb-1">Limit</th><th class="pb-1">Scope</th></tr>
+      <table class="console-table">
+        <thead>
+          <tr>
+            <th>Project</th>
+            <th>Service</th>
+            <th>Quota Metric</th>
+            <th>Location</th>
+            <th>Limit Type</th>
+          </tr>
         </thead>
         <tbody>${rows.map(r => `
-          <tr class="border-t border-gray-100">
-            <td class="py-1 pr-2">${r.project_id}</td>
-            <td class="py-1 pr-2">${r.quota_metric}</td>
-            <td class="py-1 pr-2">${r.limit_name ?? '—'}</td>
-            <td class="py-1">${r.limit_scope}</td>
+          <tr>
+            <td class="cell-project mono">${r.project_id}</td>
+            <td class="cell-service-main" title="${r.service || ''}">${shortService(r.service)}</td>
+            <td class="cell-metric-main mono" title="${r.quota_metric || ''}">${shortMetric(r.quota_metric)}</td>
+            <td><span class="loc-chip">${r.location || 'global'}</span></td>
+            <td class="limit-type-main mono">${r.limit_name ?? '—'}</td>
           </tr>`).join('')}</tbody>
-      </table>` : '<p class="text-gray-500">No rows.</p>';
+      </table>` : '<div class="dd-empty">No rows found for this flag.</div>';
   }
 
-  showTab((location.hash || '#risk').slice(1));
+  // Initialize tab and filter UI on load
+  const initialHash = (location.hash || '#risk').slice(1);
+  if (['risk', 'movers', 'hierarchy', 'quality'].includes(initialHash)) {
+    showTab(initialHash);
+  }
+  applyFilters();
 </script>
 {% endblock %}
