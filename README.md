@@ -1,723 +1,190 @@
-# Quota Monitoring and Alerting
+# Google Cloud Quota Monitoring Solution (QMS v6)
 
-> An easy-to-deploy Looker Studio Dashboard with alerting capabilities, showing
-usage and quota limits in an organization or folder.
+<p align="left">
+  <img src="dashboard/static/logo.png" alt="Cloud Quota Monitoring" width="90">
+</p>
 
-Google Cloud enforces [quotas](https://cloud.google.com/docs/quota) on resource
-usage for project owners, setting a limit on how much of a particular Google
-Cloud resource your project can use. Each quota limit represents a specific
-countable resource, such as the number of API requests made per day to the
-number of load balancers used concurrently by your application.
+> Organization-wide Google Cloud quota monitoring, 7-day and 30-day peak utilization tracking, Quota Adjuster posture visibility, and a self-hosted Cloud Console-style dashboard on Cloud Run protected by Direct Cloud Run Identity-Aware Proxy (IAP) and per-user `cloudquotas.viewer` authorization.
 
-Quotas are enforced for a variety of reasons:
+---
 
-*   To protect the community of Google Cloud users by preventing unforeseen
-    spikes in usage.
-*   To help you manage resources. For example, you can set your own limits on
-    service usage while developing and testing your applications.
+## 1. Overview
 
-We are introducing a new custom quota monitoring and alerting solution for
-Google Cloud customers.
+Google Cloud enforces [quotas](https://cloud.google.com/docs/quota) on resource usage across projects, folders, and organizations. **Quota Monitoring Solution (QMS v6)** provides an automated, low-cost, organization-wide quota observability platform built on **Cloud Run**, **BigQuery**, the **Cloud Quotas API**, and **Cloud Monitoring PromQL**.
 
-## 1. Summary
+### Key Capabilities in v6
 
-Quota Monitoring Solution is a stand-alone application of an easy-to-deploy
-Looker Studio dashboard with alerting capabilities showing all usage and quota
-limits in an organization or folder.
+* **Accurate Quota Utilization Semantics**: Normalizes rate-quota consumption (`serviceruntime.googleapis.com/quota/rate/net_usage`) to the exact enforcement interval (`refreshInterval`: per-minute vs. per-day on `US/Pacific` boundaries) and joins usage to authoritative limits via `QuotaInfo.quotaId ≡ limit_name` from the **Cloud Quotas API** (`cloudquotas.googleapis.com`).
+* **Comparability Guardrails**: Automatically detects and withholds non-comparable pairings (such as project-aggregate usage vs. per-user limits `dimensions: ["user"]`) and normalizes unlimited quota sentinels (`9223372036854775807` and `-1`), surfacing full telemetry in a dedicated **Data Quality & Guardrails** tab.
+* **7-Day & 30-Day Peak Tracking**: Stores daily peak and current usage in a partitioned, clustered BigQuery table (`quota_daily`, 400-day retention) backed by six precomputed BigQuery views (`quota_latest`, `quota_peaks`, `quota_risk`, `quota_movers`, `quota_hierarchy`, `quota_quality`).
+* **Self-Hosted Cloud Console UI (`qms-dashboard`)**: Fast, zero-dependency Cloud Console design featuring cascading searchable dropdowns (`Project`, `Service`, `Quota Metric`), instant threshold filters (`All`, `>= 50%`, `>= 80%`, `>= 90%`), a 30-day interactive trend drawer, **7d Movers**, and **Org & Folder Hierarchy** rollups (including read-only **Quota Adjuster** status per project).
+* **Direct Cloud Run IAP + Per-User IAM Scoping**: Authenticates users at Google's edge via Direct Cloud Run IAP (no External Load Balancer required) and dynamically filters dashboard data to the exact Organization, Folder, or Project scopes where the logged-in user holds `roles/cloudquotas.viewer` (or `cloudquotas.quotaInfos.list`).
+* **Lightweight Zero-Config Alerting**:
+  * **In-Browser Alert Bell & Desktop Push Notifications**: Alerts badge (`>= 80%`) in the top Console header with native Web Push notifications when a daily collection detects quota threshold breaches.
+  * **1-Click Cloud Console Real-Time Alerting**: Every quota's detail drawer generates a ready-to-paste PromQL condition (`>= 80%` of the authoritative limit) and direct deep links to create a Cloud Monitoring Alert Policy or manage the quota in Google Cloud Console.
+  * **Structured Collector Summary & Optional Webhook**: Emits a structured `QMS_QUOTA_THRESHOLD_SUMMARY` JSON event to Cloud Logging after each run and supports an optional Slack or Google Chat incoming webhook (`QMS_ALERT_WEBHOOK_URL`).
 
-### 1.1 Four Initial Features
-
-![key-features](img/quota_monitoring_key_features.png)
-
-*The data refresh rate depends on the configured frequency to run the
-application.
+---
 
 ## 2. Architecture
 
-![architecture](img/quota-monitoring-alerting-architecture.png)
+![QMS v6 Architecture](img/qms-v6-architecture.jpg)
 
-The architecture is built using Google Cloud managed services - Cloud
-Functions, Pub/Sub, Dataflow and BigQuery.
+One container image (`Dockerfile`) powers two serverless Cloud Run workloads in a single host project:
 
-*   The solution is architected to scale using Pub/Sub.
-*   Cloud Scheduler is used to trigger Cloud Functions. This is also an user
-    interface to configure frequency, parent nodes, alert threshold and email Ids.
-    Parent node could be an organization Id, folder id, list of organization Ids
-    or list of folder Ids.
-*   Cloud Functions are used to scan quotas across projects for the configured
-    parent node.
-*   BigQuery is used to store data.
-*   Alert threshold will be applicable across all metrics.
-*   Alerts can be received by Email, Mobile App, PagerDuty, SMS, Slack,
-    Webhooks and Pub/Sub. Cloud Monitoring custom log metric has been leveraged to
-    create Alerts.
-*   Easy to get started and deploy with Looker Studio Dashboard. In addition to
-    Looker Studio, other visualization tools can be configured.
-*   The Looker Studio report can be scheduled to be emailed to appropriate team
-    for weekly/daily reporting.
+1. **`qms-collector` (Cloud Run Job)**: Triggered daily by **Cloud Scheduler** (`qms-daily-collect`). Walks active projects across the organization (`HierarchySource`), queries Cloud Monitoring PromQL (`MonitoringSource`), fetches authoritative quota definitions and Quota Adjuster settings from the Cloud Quotas API (`CloudQuotasSource`), normalizes daily peaks, and loads rows into BigQuery (`BigQuerySink`) via free batch load jobs.
+2. **`qms-dashboard` (Cloud Run Service)**: Read-only FastAPI service (`min_instance_count = 0`) behind **Direct Cloud Run IAP**. Queries the precomputed BigQuery views concurrently with an in-memory stale-while-revalidate (SWR) cache and filters results per user via Cloud Asset Inventory (`analyzeIamPolicy`) and Cloud Resource Manager v3 (`getIamPolicy`).
 
-## 3. Configuring Quota Monitoring and Alerting
+---
 
-![configuration](img/quota-monitoring-config-flow.png)
+## 3. Repository Layout
 
-1.  Upload csv file with columns: project_id,email_id,app_code,dashboard_url
-2.  For applications with more than 1 projects the project_id column can take
-a string with more than project. Reference: [CSV file](./QMS_app_alerting.csv)
-3.  \*Note 1 project will only have 1 app-code, but app-code can have more
-    than 1 project.
+```text
+collector/            # Python package for quota collection, normalization, and BigQuery views
+  sources/            #   monitoring.py (PromQL), cloud_quotas.py, hierarchy.py
+  sinks/              #   bigquery.py (batch load jobs), views.py (6 precomputed SQL views)
+  alerts.py           #   Zero-config threshold evaluation, webhook digest, and PromQL builder
+  model.py            #   Immutable domain types and comparability flags
+  normalise.py        #   Enforcement interval and unlimited-sentinel normalization
+  rollup.py           #   Daily peak/current rollup across UTC and US/Pacific boundaries
+  cli.py              #   CLI entry point: `collect` | `backfill` | `verify` | `views`
+dashboard/            # Self-hosted FastAPI + Jinja2 Cloud Console UI
+  app.py              #   HTTP routes, health checks, and /api/alerts
+  authz.py            #   IAP ES256 JWT verification and cascading Org/Folder/Project IAM check
+  queries.py          #   Concurrent BigQuery view reader with SWR caching
+  static/             #   QMS logo and browser tab favicons
+  templates/          #   base.html and index.html (Risk, Movers, Hierarchy, Quality, Drawer)
+terraform/            # Terraform >= 1.5 / google provider ~> 8.0
+  modules/qms/        #   Reusable QMS module (Cloud Run Job + Service, BigQuery, Scheduler, IAM)
+  example/            #   Example root module
+tests/                # Golden-file and unit test suite (pytest)
+```
 
-    e.g. If you have two rows in the csv file:
-
-    edge-retail-374401|pub-sub-example-394521, appcode1
-
-    edge-retail-374401, appcode2
-
-    edge-retail-374401 will end up with appcode2.
-4.  Cloud scheduler will trigger configAppAlerts for each app code in csv:
-5.  Create custom log metric
-6.  Create notification channel
-7.  Create Alert using custom log metric & notification channel
-8.  Upload all data to big query
+---
 
 ## 4. Deployment Guide
 
-### Content
-
-<!-- markdownlint-disable -->
-- [Quota Monitoring and Alerting](#quota-monitoring-and-alerting)
-  - [1. Summary](#1-summary)
-    - [1.1 Four Initial Features](#11-four-initial-features)
-  - [2. Architecture](#2-architecture)
-  - [3. Deployment Guide](#3-deployment-guide)
-    - [Content](#content)
-    - [3.1 Prerequisites](#31-prerequisites)
-    - [3.2 Initial Setup](#32-initial-setup)
-    - [3.3 Create Service Account](#33-create-service-account)
-    - [3.4 Grant Roles to Service Account](#34-grant-roles-to-service-account)
-      - [3.4.1 Grant Roles in the Host Project](#341-grant-roles-in-the-host-project)
-      - [3.4.2 Grant Roles in the Target Folder](#342-grant-roles-in-the-target-folder)
-      - [3.4.3 Grant Roles in the Target Organization](#343-grant-roles-in-the-target-organization)
-    - [3.5 Download the Source Code](#35-download-the-source-code)
-    - [3.6 Download Service Account Key File](#36-download-service-account-key-file)
-    - [3.7 Configure Terraform](#37-configure-terraform)
-    - [3.8 Run Terraform](#38-run-terraform)
-    - [3.9 Testing](#39-testing)
-    - [3.10 Looker Studio Dashboard setup](#310-looker-studio-dashboard-setup)
-    - [3.11 Scheduled Reporting](#311-scheduled-reporting)
-    - [3.11 Alerting](#311-alerting)
-      - [3.11.1 Slack Configuration](#3111-slack-configuration)
-        - [3.11.1.1 Create Notification Channel](#31111-create-notification-channel)
-        - [3.11.1.2 Configuring Alerting Policy](#31112-configuring-alerting-policy)
-  - [4. Release Note](#4-release-note)
-    - [v4.0.0: Quota Monitoring across GCP services](#v400-quota-monitoring-across-gcp-services)
-      - [New](#new)
-      - [Known Limitations](#known-limitations)
-    - [v4.4.0](#v440)
-      - [New in v4.4.0](#new-in-v440)
-  - [5. What is Next](#5-what-is-next)
-  - [6. Getting Support](#6-getting-support)
-  - [7. Contributing](#7-contributing)
-<!-- markdownlint-restore -->
+See [`terraform/README.md`](terraform/README.md) for the complete infrastructure reference and IAM table.
 
 ### 4.1 Prerequisites
 
-1.  Host Project - A project where the BigQuery instance, Cloud Function and
-    Cloud Scheduler will be deployed. For example Project A.
-2.  Target Node - The Organization or folder or project which will be scanned
-    for Quota Metrics. For example Org A and Folder A.
-3.  Project Owner role on host Project A. IAM Admin role in target Org A and
-    target Folder A.
-4.  Google Cloud SDK is installed. Detailed instructions to install the SDK
-    [here](https://cloud.google.com/sdk/docs/install#mac). See the Getting Started
-    page for an introduction to using gcloud and terraform.
-5.  Terraform version >= 0.14.6 installed. Instructions to install terraform here
-    *   Verify terraform version after installing.
-
-    ```sh
-    terraform -version
-    ```
-
-    The output should look like:
-
-    ```sh
-    Terraform v0.14.6
-    + provider registry.terraform.io/hashicorp/google v3.57.0
-    ```
-
-    *Note - Minimum required version v0.14.6. Lower terraform versions may not work.*
-
-### 4.2 Initial Setup
-
-1.  In local workstation create a new directory to run terraform and store
-    credential file
-
-    ```sh
-    mkdir <directory name like quota-monitoring-dashboard>
-    cd <directory name>
-    ```
-
-2.  Set default project in config to host project A
-
-    ```sh
-    gcloud config set project <HOST_PROJECT_ID>
-    ```
-
-    The output should look like:
-
-    ```sh
-    Updated property [core/project].
-    ```
-
-3.  Ensure that the latest version of all installed components is installed on
-    the local workstation.
-
-    ```sh
-    gcloud components update
-    ```
-
-4.  Cloud Scheduler depends on the App Engine application. Create an App Engine
-    application in the host project. Replace the region. List of regions where
-    App Engine is available can be found
-    [here](https://cloud.google.com/about/locations#region).
-
-    ```sh
-    gcloud app create --region=<region>
-    ```
-
-    Note: Cloud Scheduler (below) needs to be in the same region as App Engine.
-    Use the same region in terraform as mentioned here.
-
-    The output should look like:
-
-    ```sh
-    You are creating an app for project [quota-monitoring-project-3].
-    WARNING: Creating an App Engine application for a project is irreversible and the region
-    cannot be changed. More information about regions is at
-    <https://cloud.google.com/appengine/docs/locations>.
-
-    Creating App Engine application in project [quota-monitoring-project-1] and region [us-east1]....done.
-
-    Success! The app is now created. Please use `gcloud app deploy` to deploy your first app.
-    ```
-
-### 4.3 Create Service Account
-
-1.  In local workstation, setup environment variables. Replace the name of the
-    Service Account in the commands below
-
-    ```sh
-    export DEFAULT_PROJECT_ID=$(gcloud config get-value core/project 2> /dev/null)
-    export SERVICE_ACCOUNT_ID="sa-"$DEFAULT_PROJECT_ID
-    export DISPLAY_NAME="sa-"$DEFAULT_PROJECT_ID
-    ```
-
-2.  Verify host project Id.
-
-    ```sh
-    echo $DEFAULT_PROJECT_ID
-    ```
-
-3.  Create Service Account
-
-    ```sh
-    gcloud iam service-accounts create $SERVICE_ACCOUNT_ID --description="Service Account to scan quota usage" --display-name=$DISPLAY_NAME
-    ```
-
-    The output should look like:
-
-    ```sh
-    Created service account [sa-quota-monitoring-project-1].
-    ```
-
-### 4.4 Grant Roles to Service Account
-
-#### 4.4.1 Grant Roles in the Host Project
-
-The following roles need to be added to the Service Account in the host
-project i.e. Project A:
-
-*   BigQuery
-    *   BigQuery Data Editor
-    *   BigQuery Job User
-*   Cloud Functions
-    *   Cloud Functions Admin
-*   Cloud Scheduler
-    *   Cloud Scheduler Admin
-*   Pub/Sub
-    *   Pub/Sub Admin
-*   Run Terraform
-    *   Service Account User
-    *   Enable APIs
-    *   Service Usage Admin
-*   Storage Bucket
-    *   Storage Admin
-*   Scan Quotas
-    *   Cloud Asset Viewer
-    *   Compute Network Viewer
-    *   Compute Viewer
-*   Monitoring
-    *   Notification Channel Editor
-    *   Alert Policy Editor
-    *   Viewer
-    *   Metric Writer
-*   Logs
-    *   Logs Configuration Writer
-    *   Log Writer
-*   IAM
-    *   Security Admin
-
-1.  Run following commands to assign the roles:
-
-    ```sh
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/bigquery.dataEditor" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/bigquery.jobUser" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudfunctions.admin" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudscheduler.admin" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/pubsub.admin" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/iam.serviceAccountUser" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/storage.admin" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/serviceusage.serviceUsageAdmin" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudasset.viewer" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/compute.networkViewer" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/compute.viewer" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.notificationChannelEditor" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.alertPolicyEditor" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/logging.configWriter" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/logging.logWriter" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.viewer" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.metricWriter" --condition=None
-
-    gcloud projects add-iam-policy-binding $DEFAULT_PROJECT_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/iam.securityAdmin" --condition=None
-    ```
-
-#### 4.4.2 Grant Roles in the Target Folder
-
-SKIP THIS STEP IF THE FOLDER IS NOT THE TARGET TO SCAN QUOTA
-
-If you want to scan projects in the folder, add following roles to the Service
-Account created in the previous step at the target folder A:
-
-*   Cloud Asset Viewer
-*   Compute Network Viewer
-*   Compute Viewer
-*   Folder Viewer
-*   Monitoring Viewer
-
-1.  Set target folder id
-
-    ```sh
-    export TARGET_FOLDER_ID=<target folder id like 38659473572>
-    ```
-
-2.  Run the following commands add to the roles to the service account
-
-    ```sh
-    gcloud alpha resource-manager folders add-iam-policy-binding  $TARGET_FOLDER_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudasset.viewer"
-
-    gcloud alpha resource-manager folders add-iam-policy-binding  $TARGET_FOLDER_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/compute.networkViewer"
-
-    gcloud alpha resource-manager folders add-iam-policy-binding  $TARGET_FOLDER_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/compute.viewer"
-
-    gcloud alpha resource-manager folders add-iam-policy-binding  $TARGET_FOLDER_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/resourcemanager.folderViewer"
-
-    gcloud alpha resource-manager folders add-iam-policy-binding  $TARGET_FOLDER_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/monitoring.viewer"
-    ```
-
-    Note: If this fails, run the commands again
-
-#### 4.4.3 Grant Roles in the Target Organization
-
-SKIP THIS STEP IF THE ORGANIZATION IS NOT THE TARGET
-
-If you want to scan projects in the org, add following roles to the Service
-Account created in the previous step at the Org A:
-
-*   Cloud Asset Viewer
-*   Compute Network Viewer
-*   Compute Viewer
-*   Org Viewer
-*   Folder Viewer
-*   Monitoring Viewer
-
-![org-service-acccount-roles](img/service_account_roles.png)
-
-1.  Set target organization id
-
-    ```sh
-    export TARGET_ORG_ID=<target org id ex. 38659473572>
-    ```
-
-2.  Run the following commands to add to the roles to the service account
-
-    ```sh
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudasset.viewer" --condition=None
-
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com"  --role="roles/compute.networkViewer" --condition=None
-
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com"  --role="roles/compute.viewer" --condition=None
-
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com"  --role="roles/resourcemanager.folderViewer" --condition=None
-
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com"  --role="roles/resourcemanager.organizationViewer" --condition=None
-
-    gcloud organizations add-iam-policy-binding  $TARGET_ORG_ID --member="serviceAccount:$SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com"  --role="roles/monitoring.viewer" --condition=None
-    ```
-
-### 4.5 Download the Source Code
-
-1.  Clone the Quota Management Solution repo
-
-    ```sh
-    git clone https://github.com/google/quota-monitoring-solution.git quota-monitorings-solution
-    ```
-
-2.  Change directories into the Terraform example
-
-    ```sh
-    cd ./quota-monitorings-solution/terraform/example
-    ```
-
-### 4.6 Set OAuth Token Using Service Account Impersonization
-
-Impersonate your host project service account and set environment variable
-using temporary token to authenticate terraform. You will need to make
-sure your user has the
-[Service Account Token Creator role](https://cloud.google.com/iam/docs/service-account-permissions#token-creator-role)
-to create short-lived credentials.
-
-```sh
-gcloud config set auth/impersonate_service_account \
-    $SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com
-
-export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token)
+* **Host Project**: A Google Cloud project to host BigQuery, Artifact Registry, Cloud Scheduler, and the two Cloud Run workloads.
+* **Target Organization**: Organization ID (e.g., `957650833838`) to scan.
+* **Tools**: `gcloud` CLI, `terraform >= 1.5`, and `uv` (for local development/testing).
+* **Permissions to deploy**:
+  * Project Owner (or Editor + Project IAM Admin + Run Admin + Service Account Admin) on the **Host Project**.
+  * Organization IAM Admin on the **Target Organization** to grant read-only viewer roles (`roles/monitoring.viewer`, `roles/cloudquotas.viewer`, `roles/browser`, `roles/cloudasset.viewer`, `roles/iam.securityReviewer`) to the collector and dashboard service accounts.
+
+### 4.2 Deploy with Terraform & Cloud Build
+
+```bash
+# 1. Authenticate with Google Cloud
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project <HOST_PROJECT_ID>
+
+# 2. Configure Terraform variables
+cd terraform/example
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your project_id, organization_id, region, and dashboard_invokers
+
+# 3. Phase 1: Provision APIs, Artifact Registry, staging bucket, and build service account
+terraform init
+terraform apply \
+  -target=module.qms.google_project_service.this \
+  -target=module.qms.google_artifact_registry_repository.qms \
+  -target=module.qms.google_storage_bucket.build_source \
+  -target=module.qms.google_service_account.build \
+  -target=module.qms.google_artifact_registry_repository_iam_member.build_writer \
+  -target=module.qms.google_storage_bucket_iam_member.build_source_admin \
+  -target=module.qms.google_project_iam_member.build_log_writer
+
+# 4. Phase 2: Build and push the container image via Cloud Build
+cd ../..
+gcloud builds submit \
+  --region=<REGION> \
+  --config=cloudbuild.yaml \
+  --gcs-source-staging-dir=gs://<HOST_PROJECT_ID>-qms-build-source/source \
+  --service-account=projects/<HOST_PROJECT_ID>/serviceAccounts/qms-build@<HOST_PROJECT_ID>.iam.gserviceaccount.com \
+  --project=<HOST_PROJECT_ID>
+
+# 5. Phase 3: Provision BigQuery dataset, Cloud Run Job & Service (with Direct IAP), and Scheduler
+cd terraform/example
+terraform apply
 ```
 
-*   **TIP**: If you get an error saying *unable to impersonate*, you will
-need to unset the impersonation. Have the role added similar to below, then
-try again.
+### 4.3 Create Views & Run Initial 30-Day Backfill
 
-    ```sh
-    # unset impersonation
-    gcloud config unset auth/impersonate_service_account
+```bash
+# Create or replace the 6 BigQuery views
+uv run python -m collector.cli \
+  --billing-project <HOST_PROJECT_ID> \
+  --dataset quota_monitoring \
+  --bq-location <REGION> \
+  views
 
-    # set your current authenticated user as var
-    PROJECT_USER=$(gcloud config get-value core/account)
+# Execute the collector job (or run a 30-day backfill)
+gcloud run jobs execute qms-collector --region=<REGION> --project=<HOST_PROJECT_ID> --wait
+```
 
-    # grant IAM role serviceAccountTokenCreator
-    gcloud iam service-accounts add-iam-policy-binding $SERVICE_ACCOUNT_ID@$DEFAULT_PROJECT_ID.iam.gserviceaccount.com \
-        --member user:$PROJECT_USER \
-        --role roles/iam.serviceAccountTokenCreator \
-        --condition=None
-    ```
+### 4.4 Granting Dashboard Access to Users
 
-### 4.7 Configure Terraform
+1. **IAP Access to the Cloud Run Service**: Grant `roles/iap.httpsResourceAccessor` on `qms-dashboard` to the users or Google Groups who should be able to open the dashboard URL.
+2. **Workload Quota Visibility**: Each signed-in user automatically sees only the projects where they hold `roles/cloudquotas.viewer` (or a custom role containing `cloudquotas.quotaInfos.list`) at the **Organization**, **Folder**, or **Project** level.
 
-1.  Verify that you have these 3 files in your local directory:
-    *   main.tf
-    *   variables.tf
-    *   terraform.tfvars
+---
 
-2.  Open [terraform.tfvars](terraform/example/terraform.tfvars) file in your
-    favourite editor and change values for the variables.
+## 5. Local Development & Testing
 
-    ```sh
-    vi terraform.tfvars
-    ```
+```bash
+# Run formatter, linter (including flake8-bandit security rules), and unit tests
+uv run ruff format --check .
+uv run ruff check .
+uv run pytest
 
-3.  For `region`, use the same region as used for App Engine in earlier steps.
+# Reconcile sample quota ratios against Cloud Console
+uv run python -m collector.cli \
+  --billing-project <HOST_PROJECT_ID> \
+  --organization <ORG_ID> \
+  --days 7 \
+  verify --limit 20
+```
 
-    The variables `source_code_base_url`, `qms_version`, `source_code_zip`
-    and `source_code_notification_zip` on the QMS module are used to download
-    the source for the QMS Cloud Functions from the latest GitHub [release](https://github.com/google/quota-monitoring-solution/releases).
+---
 
-    To deploy the latest unreleased code from a local clone of the QMS
-    repository, set `qms_version` to `main`
+## 6. Cost
 
-### 4.8 Run Terraform
+QMS v6 is designed to run at minimal operational cost by combining scale-to-zero serverless workloads, free BigQuery batch load jobs, in-memory stale-while-revalidate view caching, and Direct Cloud Run IAP (avoiding the fixed ~$18/month cost of an External Application Load Balancer).
 
-1.  Run terraform commands
-    *   `terraform init`
-    *   `terraform plan`
-    *   `terraform apply`
-        *   On Prompt Enter a value: `yes`
+### 6.1 Cost Components
 
-2.  This will:
-    *   Enable required APIs
-    *   Create all resources and connect them.
+* **Cloud Run Job (`qms-collector`)**: `1 vCPU`, `1 GiB` memory, executed once daily (`30 2 * * *`). Billed only for the seconds the job runs (~6 minutes/day for 100 projects).
+* **Cloud Run Service (`qms-dashboard`)**: `1 vCPU`, `512 MiB` memory with `min_instance_count = 0` (scales to zero when idle). Client-side filtering/sorting and a 5-minute in-memory cache minimize active CPU time.
+* **BigQuery (`quota_monitoring`)**:
+  * **Ingestion**: Uses batch load jobs (`load_table_from_json`), which are **$0.00 (free)**.
+  * **Storage**: Partitioned by `usage_date_utc` and clustered by `(project_id, service, quota_metric)` with 400-day retention (~1.4 GB logical storage for 100 projects; partitions older than 90 days automatically drop to Long-Term Storage pricing).
+  * **Queries**: Dashboard reads precomputed views cached in memory for 5 minutes rather than issuing per-click queries.
+* **Cloud Monitoring, Cloud Quotas, Cloud Asset & CRM APIs**: Cloud Quotas, Cloud Asset Inventory, and Cloud Resource Manager API calls are free; Cloud Monitoring API reads (`query_range` on GCP `serviceruntime` quota metrics) include 1,000,000 free API read calls/month per billing account ($0.01 per 1,000 calls thereafter).
+* **Direct Cloud Run IAP, Cloud Scheduler & Artifact Registry**: Direct Cloud Run IAP has no hourly load-balancer fee; Cloud Scheduler is $0.10/month for the single daily cron job; Artifact Registry stores one ~180 MB container image (~$0.02/month).
 
-    Note: In case terraform fails, run terraform plan and terraform apply again
+### 6.2 Estimated Monthly Cost & Scaling by Project Count
 
-3.  Stop impersonating service account (when finished with terraform)
+Because `QuotaInfo` limit definitions are cached per GCP service (`O(distinct services)` rather than `O(projects × services)`) and the dashboard serves cached view snapshots in memory, total cost scales gently as the number of monitored projects grows:
 
-    ```sh
-    gcloud config unset auth/impersonate_service_account
-    ```
+| Monitored Projects | Daily Collector Runtime | Cloud Run (`qms-collector` + `qms-dashboard`) | BigQuery (Storage + Cached View Queries) | Monitoring API, Scheduler & Artifact Registry | **Estimated Total Monthly Cost (Gross List Price)** |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **100 Projects** | ~6 min / day | ~$1.65 – $2.30 | ~$0.35 – $3.20 | ~$0.20 – $0.25 | **~$2.20 – $5.75 / month** |
+| **500 Projects** | ~25 min / day | ~$2.80 – $3.60 | ~$1.50 – $6.00 | ~$0.50 – $0.65 | **~$4.80 – $10.25 / month** |
+| **1,000 Projects** | ~45 min / day | ~$4.20 – $5.40 | ~$3.00 – $10.00 | ~$0.90 – $1.10 | **~$8.10 – $16.50 / month** |
 
-### 4.9 Testing
+*(When GCP monthly free tiers for Cloud Run, BigQuery 1 TiB query / 10 GB storage, and Cloud Monitoring 1M API reads are available on the billing account, net cost for a 100-project deployment is typically under **$0.25 / month**.)*
 
-1.  Initiate first job run in Cloud Scheduler.
+> **Disclaimer:** Costs are indicatory and to be used purely for estimation. Actual costs should be monitored for accuracy.
 
-    **Console**
+---
 
-    Click 'Run Now' on Cloud Job scheduler.
+## 7. Getting Support & Contributing
 
-    *Note: The status of the ‘Run Now’ button changes to ‘Running’ for a fraction
-    of seconds.*
-
-    ![run-cloud-scheduler](img/run_cloud_scheduler.png)
-
-    **Terminal**
-
-    ```sh
-    gcloud scheduler jobs run quota-monitoring-cron-job --location <region>
-    gcloud scheduler jobs run quota-monitoring-app-alert-config --location <region>
-    ```
-
-2.  To verify that the program ran successfully, check the BigQuery Table. The
-    time to load data in BigQuery might take a few minutes. The execution time
-    depends on the number of projects to scan. A sample BigQuery table will look
-    like this:
-    ![test-bigquery-table](img/test_bigquery_table.png)
-
-### 4.10 Looker Studio Dashboard setup
-
-1.  Go to the [Looker Studio dashboard template](https://lookerstudio.google.com/reporting/f5e179e9-29e1-46c2-a443-97f5e24edd64).
-    A Looker Studio dashboard will look like this:
-    ![ds-updated-quotas-dashboard](img/ds-updated-quotas-dashboard.png)
-2.  Make a copy of the template from the copy icon at the top bar (top - right
-    corner)
-    ![ds-dropdown-copy](img/ds-dropdown-copy.png)
-3.  Click on ‘Copy Report’ button **without changing datasource options**
-    ![ds-copy-report-fixed-new-data-source](img/ds-copy-report-fixed-new-data-source.png)
-4.  This will create a copy of the report and open in Edit mode. If not click on
-    ‘Edit’ button on top right corner in copied template:
-    ![ds-edit-mode-updated](img/ds-edit-mode-updated.png)
-5.  Select any one table like below ‘Disks Total GB - Quotas’ is selected. On the
-    right panel in ‘Data’ tab, click on icon ‘edit data source’
-    ![ds_edit_data_source](img/ds_edit_data_source.png)
-    It will open the data source details
-    ![ds_datasource_config_step_1]img/ds_datasource_config_step_1.png
-6.  Replace the BigQuery Project Id of your bq table, Dataset Id and Table Name to
-    match your deployment. If you assigned app codes add a list of  project ids in
-    where clause  from the csv file upload. Verify the query by running in BigQuery
-    Editor for accuracy & syntax:
-
-    ```sql
-    #For org level dashboard use the following query
-    SELECT
-        project_id,
-        added_at,
-        region,
-        quota_metric,
-        CASE
-            WHEN CAST(quota_limit AS STRING) ='9223372036854775807' THEN 'unlimited'
-        ELSE
-            CAST(quota_limit AS STRING)
-        END AS str_quota_limit,
-        SUM(current_usage) AS current_usage,
-        ROUND((SAFE_DIVIDE(CAST(SUM(current_usage) AS BIGNUMERIC), CAST(quota_limit AS BIGNUMERIC))*100),2) AS current_consumption,
-        SUM(max_usage) AS max_usage,
-        ROUND((SAFE_DIVIDE(CAST(SUM(max_usage) AS BIGNUMERIC), CAST(quota_limit AS BIGNUMERIC))*100),2) AS max_consumption
-    FROM
-        (
-            SELECT
-                *,
-                RANK() OVER (PARTITION BY project_id, region, quota_metric ORDER BY added_at DESC) AS latest_row
-            FROM
-                `[YOUR_PROJECT_ID].quota_monitoring_dataset.quota_monitoring_table`
-        ) t
-    WHERE
-        latest_row=1
-        AND current_usage IS NOT NULL
-        AND quota_limit IS NOT NULL
-        AND current_usage != 0
-        AND quota_limit != 0
-        GROUP BY
-        project_id,
-        region,
-        quota_metric,
-        added_at,
-        quota_limit
-    
-    # For app level dashboard use the following query replace PROJECT_ID with project_ids from csv file upload
-    SELECT 
-        project_id,
-        added_at,
-        region,
-        quota_metric,
-        CASE
-            WHEN CAST(quota_limit AS STRING) ='9223372036854775807' THEN 'unlimited'
-        ELSE
-            CAST(quota_limit AS STRING)
-        END AS str_quota_limit,
-        SUM(current_usage) AS current_usage,
-        ROUND((SAFE_DIVIDE(CAST(SUM(current_usage) AS BIGNUMERIC), CAST(quota_limit AS BIGNUMERIC))*100),2) AS current_consumption,
-        SUM(max_usage) AS max_usage,
-        ROUND((SAFE_DIVIDE(CAST(SUM(max_usage) AS BIGNUMERIC), CAST(quota_limit AS BIGNUMERIC))*100),2) AS max_consumption
-    FROM
-        (
-            SELECT
-                *,
-                RANK() OVER (PARTITION BY project_id, region, quota_metric ORDER BY added_at DESC) AS latest_row
-            FROM
-                `[YOUR_PROJECT_ID].quota_monitoring_dataset.quota_monitoring_table`
-        ) t
-    WHERE
-        latest_row=1
-        AND current_usage IS NOT NULL
-        AND quota_limit IS NOT NULL
-        AND current_usage != 0
-        AND quota_limit != 0
-        AND project-id IN ([PROJECT_ID1], [PROJECT_ID2]..)
-        GROUP BY
-        project_id,
-        region,
-        quota_metric,
-        added_at,
-        quota_limit
-    ```
-
-7.  After making sure that query is returning results, replace it in the Data
-    Studio, click on the ‘Reconnect’ button in the data source pane.
-    ![ds_data_source_config_step_3](img/ds_data_source_config_step_3.png)
-8.  In the next window, click on the ‘Done’ button.
-    ![ds_data_source_config_step_2](img/ds_data_source_config_step_2.png)
-9.  Once the data source is configured, click on the ‘View’ button on the top
-     right corner.
-     Note: make additional changes in the layout like which metrics to be displayed
-     on Dashboard, color shades for consumption column, number of rows for each
-     table etc in the ‘Edit’ mode.
-     ![ds-switch-to-view-mode](img/ds-switch-to-view-mode.png)
-
-### 4.11 Scheduled Reporting
-
-Quota monitoring reports can be scheduled from the Looker Studio dashboard using
-‘Schedule email delivery’. The screenshot of the Looker Studio dashboard will be
-delivered as a pdf report to the configured email Ids.
-
-![ds-schedule-email-button](img/ds-schedule-email-button.png)
-
-### 4.11 Alerting
-
-The alerts about services nearing their quota limits can be configured to be
-sent via email as well as following external services:
-
-*   Slack
-*   PagerDuty
-*   SMS
-*   Custom Webhooks
-
-#### 4.11.1 Slack Configuration
-
-To configure notifications to be sent to a Slack channel, you must have the
-Monitoring Notification Channel Editor role on the host project.
-
-##### 4.11.1.1 Create Notification Channel
-
-1.  In the Cloud Console, use the project picker to select your Google Cloud
-    project, and then select Monitoring, or click the link here: Go to Monitoring
-2.  In the Monitoring navigation pane, click  Alerting.
-3.  Click Edit notification channels.
-4.  In the Slack section, click Add new. This brings you to the Slack sign-in
-    page:
-    *   Select your Slack workspace.
-    *   Click Allow to enable Google Cloud Monitoring access to your Slack
-        workspace. This action takes you back to the Monitoring configuration page
-        for your notification channel.
-    *   Enter the name of the Slack channel you want to use for notifications.
-    *   Enter a display name for the notification channel.
-5.  In your Slack workspace:
-    *   Invite the Monitoring app to the channel by sending the following
-        message in the channel:
-    *   /invite @Google Cloud Monitoring
-    *   Be sure you invite the Monitoring app to the channel you specified when
-        creating the notification channel in Monitoring.
-
-##### 4.11.1.2 Configuring Alerting Policy
-
-1.  In the Alerting section, click on Policies.
-2.  Find the Policy named ‘Resource Reaching Quotas’. This policy was created
-    via Terraform code above.
-3.  Click Edit.
-4.  It opens an Edit Alerting Policy page. Leave the current condition metric as
-    is, and click on Next.
-5.  In the Notification Options, Select the Slack Channel that you created above.
-6.  Click on Save.
-
-You should now receive alerts in your Slack channel whenever a quota reaches
-the specified threshold limit.
-
-## 5. Release Note
-
-### v4.0.0: Quota Monitoring across GCP services
-
-#### New
-
-*   The new version provides visibility into Quotas across various GCP services
-    beyond the original GCE (Compute).
-*   New Looker Studio Dashboard template reporting metrics across GCP services
-
-#### Known Limitations
-
-*   The records are grouped by hour. Scheduler need to be configured to start
-    running preferably at the beginning of the hour.
-*   Out of the box solution is configured to scan quotas ‘once every day’. The
-    SQL query to build the dashboard uses current date to filter the records. If
-    you change the frequency, make changes to the query to rightly reflect the
-    latest data.
-
-### v4.4.0
-
-#### New in v4.4.0
-
-*   The new version includes a fix that converts the data pull process to use
-    the Montoring Query Language (MQL). This allows QMS to pull the limit and
-    current usage at the exact same time, so reporting queries can be more
-    tightly scoped, eliminating over reporting problems.
-
-    To upgrade existing installations:
-
-    *   Re-run the Terraform, to update the Cloud Functions and Scheduled Query
-    *   Update the SQL used in the Looker Studio dashboard according to Step #7
-        of [4.10 Looker Studio Dashboard setup](#410-looker-studio-dashboard-setup).
-
-## 6. What is Next
-
-1.  Graphs (Quota utilization over a period of time)
-2.  Search project, folder, org, region
-3.  Threshold configurable for each metric
-
-## 7. Getting Support
-
-Quota Monitoring Solution is a project based on open source contributions. We'd
-love for you to [report issues, file feature requests][new-issue], and
-[send pull requests][new-pr] (see [Contributing](README.md#7-contributing)). Quota
-Monitoring Solution is not officially covered by the Google Cloud product support.
-
-## 8. Contributing
-
-*   [Contributing guidelines][contributing-guidelines]
-*   [Code of conduct][code-of-conduct]
-
-<!-- LINKS: https://www.markdownguide.org/basic-syntax/#reference-style-links -->
-
-[code-of-conduct]: code-of-conduct.md
-[contributing-guidelines]: CONTRIBUTING.md
-[new-issue]: https://github.com/google/quota-monitoring-solution/issues/new
-[new-pr]: https://github.com/google/quota-monitoring-solution/compare
+* [Contributing guidelines](CONTRIBUTING.md)
+* [Code of conduct](code-of-conduct.md)
+* Quota Monitoring Solution is an open-source solution and is not officially covered by Google Cloud product support.
