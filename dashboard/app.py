@@ -7,7 +7,10 @@ meaningful at all. Serving it ourselves costs one small Cloud Run service and
 makes the data-quality view possible.
 
 Read-only by design: it issues SELECTs against precomputed views and has no
-write path to anything.
+write path to anything. Every user-facing route enforces both cryptographic
+caller authentication (Direct Cloud Run IAP JWT or Google OIDC Bearer token)
+and per-user project authorization (`cloudquotas.quotaInfos.list` evaluated
+across Org / Folder / Project hierarchy via Cloud Asset Inventory).
 """
 
 from __future__ import annotations
@@ -23,6 +26,14 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from .authz import (
+    AuthzContext,
+    CallerIdentity,
+    UnauthenticatedError,
+    authenticate_request,
+    authorizer,
+    clear_authz_cache,
+)
 from .queries import Repository, clear_cache, severity
 
 _LOG = logging.getLogger(__name__)
@@ -44,6 +55,27 @@ def repo() -> Repository:
     if _repo is None:
         _repo = Repository()
     return _repo
+
+
+def _require_caller(request: Request) -> CallerIdentity:
+    try:
+        return authenticate_request(request)
+    except UnauthenticatedError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+def _resolve_authz(caller: CallerIdentity, r: Repository) -> AuthzContext:
+    r.warm_caches()
+    targets = r.known_projects()
+    auth = authorizer()
+    allowed = auth.allowed_projects(caller.email, targets)
+    return AuthzContext(
+        email=caller.email,
+        auth_source=caller.auth_source,
+        permission=auth.permission,
+        allowed_projects=allowed,
+        total_projects=len(targets),
+    )
 
 
 @contextlib.asynccontextmanager
@@ -123,11 +155,18 @@ def index(
     min_ratio: float = Query(0.0, ge=0.0, le=1.0),
     limit: int = Query(500, ge=1, le=2000),
 ) -> HTMLResponse:
+    caller = _require_caller(request)
     r = repo()
     try:
-        snap = r.snapshot(limit=limit, min_ratio=min_ratio)
+        authz_ctx = _resolve_authz(caller, r)
+        snap = r.snapshot(
+            limit=limit,
+            min_ratio=min_ratio,
+            allowed_projects=authz_ctx.allowed_projects,
+        )
         context = {
             **snap,
+            "authz": authz_ctx,
             "min_ratio": min_ratio,
             "host_project": r.project,
             "dataset": r.dataset,
@@ -142,6 +181,13 @@ def index(
             "hierarchy": [],
             "quality": [],
             "freshness": {},
+            "authz": AuthzContext(
+                email=caller.email,
+                auth_source=caller.auth_source,
+                permission=authorizer().permission,
+                allowed_projects=frozenset(),
+                total_projects=0,
+            ),
             "min_ratio": min_ratio,
             "host_project": os.environ.get("QMS_PROJECT", ""),
             "dataset": os.environ.get("QMS_DATASET", "quota_monitoring"),
@@ -152,14 +198,25 @@ def index(
 
 @app.get("/api/history")
 def history(
+    request: Request,
     project_id: str,
     service: str,
     quota_metric: str,
     location: str,
     limit_name: str = "",
 ) -> dict:
+    caller = _require_caller(request)
+    r = repo()
+    authz_ctx = _resolve_authz(caller, r)
+    if project_id not in authz_ctx.allowed_projects:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Principal {caller.email} lacks {authz_ctx.permission} on project {project_id}"
+            ),
+        )
     try:
-        rows = repo().history(
+        rows = r.history(
             project_id=project_id,
             service=service,
             quota_metric=quota_metric,
@@ -172,17 +229,22 @@ def history(
 
 
 @app.get("/api/quality/{flag}")
-def quality_detail(flag: str) -> dict:
+def quality_detail(request: Request, flag: str) -> dict:
+    caller = _require_caller(request)
+    r = repo()
+    authz_ctx = _resolve_authz(caller, r)
     try:
-        return {"rows": repo().quality_rows(flag)}
+        return {"rows": r.quality_rows(flag, allowed_projects=authz_ctx.allowed_projects)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/refresh")
-def refresh() -> dict:
-    """Drop the cache and trigger a fresh parallel snapshot."""
+def refresh(request: Request) -> dict:
+    """Drop both data and IAM authorization caches and trigger a fresh snapshot."""
+    _require_caller(request)
     clear_cache()
+    clear_authz_cache()
     if os.environ.get("QMS_PROJECT"):
         repo().warm_async()
     return {"status": "cleared"}
@@ -200,6 +262,11 @@ def main() -> None:
     parser.add_argument("--dataset", default=os.environ.get("QMS_DATASET", "quota_monitoring"))
     parser.add_argument("--bq-location", default=os.environ.get("QMS_BQ_LOCATION", "US"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument(
+        "--dev-user",
+        default="",
+        help="Local development only: set QMS_AUTHZ_MODE=dev and QMS_DEV_USER_EMAIL.",
+    )
     args = parser.parse_args()
 
     if args.project:
@@ -211,6 +278,9 @@ def main() -> None:
     if args.bq_location:
         os.environ["QMS_BQ_LOCATION"] = args.bq_location
         qmod.LOCATION = args.bq_location
+    if args.dev_user and not os.environ.get("K_SERVICE"):
+        os.environ["QMS_AUTHZ_MODE"] = "dev"
+        os.environ["QMS_DEV_USER_EMAIL"] = args.dev_user
 
     uvicorn.run(
         app,

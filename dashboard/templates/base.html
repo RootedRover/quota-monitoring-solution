@@ -819,6 +819,13 @@
       </div>
 
       <div class="header-actions">
+        {% if authz and authz.email %}
+        <div class="context-pill" title="Verified caller identity ({{ authz.auth_source | upper }}) and projects where caller holds {{ authz.permission }}">
+          <span>Viewer:</span>
+          <strong class="mono">{{ authz.email }}</strong>
+          <span>&middot; {{ authz.allowed_count }}/{{ authz.total_projects }} projects</span>
+        </div>
+        {% endif %}
         <button id="btn-refresh-cache" onclick="refreshCache()" class="btn-header" title="Clear in-memory cache and reload from BigQuery views">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
@@ -837,6 +844,16 @@
       <div class="alert-error">
         <p class="alert-error-title">Could not query BigQuery views</p>
         <pre class="alert-error-pre mono">{{ error }}</pre>
+      </div>
+    {% endif %}
+    {% if authz and authz.total_projects > 0 and authz.allowed_count == 0 %}
+      <div class="alert-error" style="background: var(--sev-warning-bg); border-color: var(--sev-warning-border); color: var(--sev-warning-text);">
+        <p class="alert-error-title">No accessible projects for <span class="mono">{{ authz.email }}</span></p>
+        <p style="margin: 0; font-size: 12.5px;">
+          Dashboard visibility is scoped per user via IAM. Grant <code class="mono">roles/cloudquotas.viewer</code>
+          (or a custom role containing <code class="mono">{{ authz.permission }}</code>) to <code class="mono">{{ authz.email }}</code>
+          at the <strong>Project</strong>, <strong>Folder</strong>, or <strong>Organization</strong> level for the workloads you manage, then click <strong>Refresh cache</strong>.
+        </p>
       </div>
     {% endif %}
     {% block content %}{% endblock %}

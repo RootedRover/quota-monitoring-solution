@@ -111,3 +111,14 @@ variable "delete_dataset_contents_on_destroy" {
   EOT
   default     = false
 }
+
+variable "iap_enabled" {
+  type        = bool
+  description = <<-EOT
+    Enable Direct Cloud Run Identity-Aware Proxy (IAP) on the dashboard service.
+    When true, browser requests are authenticated at Google's edge by IAP and
+    carry a signed x-goog-iap-jwt-assertion header verified by the dashboard
+    before evaluating per-user cloudquotas.quotaInfos.list project access.
+  EOT
+  default     = true
+}

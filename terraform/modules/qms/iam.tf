@@ -110,6 +110,36 @@ resource "google_project_iam_member" "dashboard_jobs" {
   member  = google_service_account.dashboard.member
 }
 
+# Read-only IAM policy analysis across the organisation so the dashboard can
+# enforce Option B per-user row-level authorization (filtering projects to those
+# where the signed-in caller holds cloudquotas.quotaInfos.list at Org, Folder,
+# or Project scope).
+#
+# Cloud Asset analyzeIamPolicy requires:
+#   * roles/cloudasset.viewer                (analyzeIamPolicy, searchAllIamPolicies, searchAllResources)
+#   * roles/iam.securityReviewer             (iam.roles.get for custom roles + getIamPolicy fallback)
+#   * roles/serviceusage.serviceUsageConsumer on the host project (serviceusage.services.use)
+locals {
+  dashboard_org_roles = [
+    "roles/cloudasset.viewer",
+    "roles/iam.securityReviewer",
+  ]
+}
+
+resource "google_organization_iam_member" "dashboard_iam_analyzer" {
+  for_each = toset(local.dashboard_org_roles)
+
+  org_id = var.organization_id
+  role   = each.value
+  member = google_service_account.dashboard.member
+}
+
+resource "google_project_iam_member" "dashboard_service_usage" {
+  project = var.project_id
+  role    = "roles/serviceusage.serviceUsageConsumer"
+  member  = google_service_account.dashboard.member
+}
+
 # --------------------------------------------------------- build: narrowed
 #
 # The first cut of this deployment gave the build account project-wide
@@ -188,4 +218,36 @@ resource "google_cloud_run_v2_service_iam_member" "dashboard_invokers" {
   name     = google_cloud_run_v2_service.dashboard.name
   role     = "roles/run.invoker"
   member   = each.value
+}
+
+# When Direct Cloud Run IAP is enabled, Google's IAP service agent invokes the
+# Cloud Run revision on behalf of authenticated users, and dashboard_invokers
+# are granted roles/iap.httpsResourceAccessor on the IAP-secured service.
+resource "google_cloud_run_v2_service_iam_member" "iap_service_agent_invoker" {
+  count = var.iap_enabled ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.dashboard.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-iap.iam.gserviceaccount.com"
+
+  depends_on = [google_cloud_run_v2_service.dashboard]
+}
+
+resource "google_iap_web_cloud_run_service_iam_member" "dashboard_iap_accessors" {
+  for_each = var.iap_enabled ? toset(var.dashboard_invokers) : toset([])
+
+  project                = var.project_id
+  location               = var.region
+  cloud_run_service_name = google_cloud_run_v2_service.dashboard.name
+  role                   = "roles/iap.httpsResourceAccessor"
+  member                 = each.value
+
+  depends_on = [google_cloud_run_v2_service.dashboard]
+}
+
+moved {
+  from = google_organization_iam_member.dashboard_iam_analyzer
+  to   = google_organization_iam_member.dashboard_iam_analyzer["roles/cloudasset.viewer"]
 }

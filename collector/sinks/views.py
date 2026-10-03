@@ -143,6 +143,7 @@ SELECT
   org_id,
   folder_id,
   project_id,
+  MAX(project_number) AS project_number,
   MAX(quota_adjuster_enabled) AS quota_adjuster_enabled,
   COUNT(*) AS quotas_tracked,
   COUNTIF(peak_ratio_30d >= 0.9) AS critical_30d,
@@ -156,6 +157,9 @@ GROUP BY org_id, folder_id, project_id
         "quota_quality": f"""
 SELECT
   usage_date_utc,
+  org_id,
+  folder_id,
+  project_number,
   {_GRAIN},
   quota_class,
   limit_scope,

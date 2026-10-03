@@ -8,10 +8,10 @@ Performance architecture:
 * **Parallel cold-start fan-out**: on a cold cache, :meth:`Repository.snapshot`
   dispatches the view queries concurrently across a thread pool rather than
   serially, cutting cold-load latency from ~7x single-query RTT to 1x RTT.
-* **Zero-query summary derivation**: headline KPI counters (tracked, critical,
-  warning, distinct projects, distinct services, last seen) are computed in
-  memory from the cached ``quota_risk`` rows, eliminating two redundant BigQuery
-  round-trips per page load.
+* **Zero-query summary & per-user row filtering**: headline KPI counters
+  (tracked, critical, warning, distinct projects, distinct services, last seen,
+  excluded) and per-user ``allowed_projects`` scoping are computed in memory
+  from the cached view rows, adding 0ms of BigQuery latency per user.
 * **Stale-while-revalidate (SWR) + single-flight cache**: once a key has been
   populated, expired entries are returned immediately from memory while a
   background thread refreshes BigQuery asynchronously. User page loads after
@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,8 @@ from typing import Any
 from google.cloud import bigquery
 
 from collector.bqnames import validate_name, validate_project
+
+from .authz import ProjectTarget
 
 _LOG = logging.getLogger(__name__)
 
@@ -184,26 +187,21 @@ class Repository:
 
         return _cache.get_or_set("risk:all", produce)
 
-    def risk(self, *, limit: int = 500, min_ratio: float = 0.0) -> list[dict]:
-        """The main table: every comparable quota, worst first."""
-        rows = self._all_risk()
-        if min_ratio > 0.0:
-            rows = [r for r in rows if (r.get("peak_ratio_30d") or 0.0) >= min_ratio]
-        return rows[:limit]
+    def _all_movers(self) -> list[dict]:
+        """Cached movers across the organisation; filtered per user in-memory."""
 
-    def movers(self, *, limit: int = 50) -> list[dict]:
         def produce() -> list[dict]:
             sql = f"""
             SELECT *
             FROM {self._view("quota_movers")}
             ORDER BY delta DESC
-            LIMIT @limit
+            LIMIT 200
             """
-            return self._rows(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
+            return self._rows(sql)
 
-        return _cache.get_or_set(f"movers:{limit}", produce)
+        return _cache.get_or_set("movers:all", produce)
 
-    def hierarchy(self) -> list[dict]:
+    def _all_hierarchy(self) -> list[dict]:
         def produce() -> list[dict]:
             sql = f"""
             SELECT *
@@ -214,26 +212,162 @@ class Repository:
 
         return _cache.get_or_set("hierarchy", produce)
 
-    def quality(self) -> list[dict]:
-        """Flag counts, and how many distinct quotas each flag affects."""
+    def _all_quality_by_project(self) -> list[dict]:
+        """Per-(project_id, flag) counts so per-user quality rollups are additive."""
 
         def produce() -> list[dict]:
             sql = f"""
             SELECT
+              project_id,
               flag,
               LOGICAL_AND(is_comparable) AS is_comparable,
               COUNT(*) AS row_count,
               COUNT(DISTINCT FORMAT('%s|%s|%s|%s',
                 project_id, service, quota_metric, IFNULL(limit_name, ''))) AS quota_count
             FROM {self._view("quota_quality")}
-            GROUP BY flag
+            GROUP BY project_id, flag
             ORDER BY row_count DESC
             """
             return self._rows(sql)
 
-        return _cache.get_or_set("quality", produce)
+        return _cache.get_or_set("quality:by_project", produce)
 
-    def quality_rows(self, flag: str, *, limit: int = 100) -> list[dict]:
+    def warm_caches(self) -> None:
+        """Populate all 5 shared view caches concurrently (1x BigQuery RTT on cold start)."""
+        futs = [
+            _POOL.submit(self._all_risk),
+            _POOL.submit(self._all_movers),
+            _POOL.submit(self._all_hierarchy),
+            _POOL.submit(self._all_quality_by_project),
+            _POOL.submit(self.freshness),
+        ]
+        for fut in futs:
+            fut.result()
+
+    def known_projects(self) -> list[ProjectTarget]:
+        """Return every distinct project in the warehouse with its org/folder ancestry."""
+        by_id: dict[str, ProjectTarget] = {}
+
+        for row in self._all_risk():
+            pid = str(row.get("project_id") or "")
+            if not pid:
+                continue
+            existing = by_id.get(pid)
+            by_id[pid] = ProjectTarget(
+                project_id=pid,
+                project_number=str(
+                    row.get("project_number")
+                    or (existing.project_number if existing else "")
+                    or ""
+                ),
+                folder_id=str(
+                    row.get("folder_id") or (existing.folder_id if existing else "") or ""
+                ),
+                org_id=str(row.get("org_id") or (existing.org_id if existing else "") or ""),
+            )
+
+        for row in self._all_hierarchy():
+            pid = str(row.get("project_id") or "")
+            if not pid:
+                continue
+            existing = by_id.get(pid)
+            by_id[pid] = ProjectTarget(
+                project_id=pid,
+                project_number=str(
+                    row.get("project_number")
+                    or (existing.project_number if existing else "")
+                    or ""
+                ),
+                folder_id=str(
+                    row.get("folder_id") or (existing.folder_id if existing else "") or ""
+                ),
+                org_id=str(row.get("org_id") or (existing.org_id if existing else "") or ""),
+            )
+
+        for row in self._all_quality_by_project():
+            pid = str(row.get("project_id") or "")
+            if pid and pid not in by_id:
+                by_id[pid] = ProjectTarget(project_id=pid)
+
+        return sorted(by_id.values(), key=lambda t: t.project_id)
+
+    def risk(
+        self,
+        *,
+        limit: int = 500,
+        min_ratio: float = 0.0,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """The main table: every comparable quota, worst first."""
+        rows = self._all_risk()
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+        if min_ratio > 0.0:
+            rows = [r for r in rows if (r.get("peak_ratio_30d") or 0.0) >= min_ratio]
+        return rows[:limit]
+
+    def movers(
+        self,
+        *,
+        limit: int = 50,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
+        rows = self._all_movers()
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+        return rows[:limit]
+
+    def hierarchy(
+        self,
+        *,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
+        rows = self._all_hierarchy()
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+        return rows
+
+    def quality(
+        self,
+        *,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
+        """Flag counts, and how many distinct quotas each flag affects."""
+        rows = self._all_quality_by_project()
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            flag = str(r.get("flag") or "OK")
+            agg = grouped.get(flag)
+            if agg is None:
+                grouped[flag] = {
+                    "flag": flag,
+                    "is_comparable": bool(r.get("is_comparable", True)),
+                    "row_count": int(r.get("row_count") or 0),
+                    "quota_count": int(r.get("quota_count") or 0),
+                }
+            else:
+                agg["is_comparable"] = agg["is_comparable"] and bool(
+                    r.get("is_comparable", True)
+                )
+                agg["row_count"] += int(r.get("row_count") or 0)
+                agg["quota_count"] += int(r.get("quota_count") or 0)
+
+        return sorted(grouped.values(), key=lambda x: x["row_count"], reverse=True)
+
+    def quality_rows(
+        self,
+        flag: str,
+        *,
+        limit: int = 100,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> list[dict]:
         def produce() -> list[dict]:
             sql = f"""
             SELECT DISTINCT
@@ -242,22 +376,30 @@ class Repository:
               daily_peak_usage
             FROM {self._view("quota_quality")}
             WHERE flag = @flag
-            LIMIT @limit
+            LIMIT 500
             """
             return self._rows(
                 sql,
-                [
-                    bigquery.ScalarQueryParameter("flag", "STRING", flag),
-                    bigquery.ScalarQueryParameter("limit", "INT64", limit),
-                ],
+                [bigquery.ScalarQueryParameter("flag", "STRING", flag)],
             )
 
-        return _cache.get_or_set(f"quality_rows:{flag}:{limit}", produce)
+        rows = _cache.get_or_set(f"quality_rows:{flag}", produce)
+        if allowed_projects is not None:
+            allowed = set(allowed_projects)
+            rows = [r for r in rows if r.get("project_id") in allowed]
+        return rows[:limit]
 
-    def summary(self) -> dict:
+    def summary(
+        self,
+        *,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> dict:
         """Headline counters derived in-memory from cached risk + quality views."""
-        risk_rows = self._all_risk()
-        quality_rows = self.quality()
+        allowed = set(allowed_projects) if allowed_projects is not None else None
+        risk_rows = [
+            r for r in self._all_risk() if allowed is None or r.get("project_id") in allowed
+        ]
+        quality_rows = self.quality(allowed_projects=allowed)
 
         critical = 0
         warning = 0
@@ -296,25 +438,23 @@ class Repository:
             "excluded": excluded,
         }
 
-    def snapshot(self, *, limit: int = 500, min_ratio: float = 0.0) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        limit: int = 500,
+        min_ratio: float = 0.0,
+        allowed_projects: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         """Fetch all dashboard panels in parallel (1x BigQuery RTT when cold)."""
-        fut_risk = _POOL.submit(self._all_risk)
-        fut_movers = _POOL.submit(self.movers)
-        fut_hierarchy = _POOL.submit(self.hierarchy)
-        fut_quality = _POOL.submit(self.quality)
-        fut_freshness = _POOL.submit(self.freshness)
-
-        # Wait for the core datasets in parallel.
-        fut_risk.result()
-        fut_quality.result()
-
+        self.warm_caches()
+        allowed = set(allowed_projects) if allowed_projects is not None else None
         return {
-            "summary": self.summary(),
-            "risk": self.risk(limit=limit, min_ratio=min_ratio),
-            "movers": fut_movers.result(),
-            "hierarchy": fut_hierarchy.result(),
-            "quality": fut_quality.result(),
-            "freshness": fut_freshness.result(),
+            "summary": self.summary(allowed_projects=allowed),
+            "risk": self.risk(limit=limit, min_ratio=min_ratio, allowed_projects=allowed),
+            "movers": self.movers(allowed_projects=allowed),
+            "hierarchy": self.hierarchy(allowed_projects=allowed),
+            "quality": self.quality(allowed_projects=allowed),
+            "freshness": self.freshness(),
         }
 
     def warm_async(self) -> None:
@@ -322,7 +462,7 @@ class Repository:
 
         def _warm() -> None:
             try:
-                self.snapshot()
+                self.warm_caches()
                 _LOG.info("dashboard cache warmed")
             except Exception:  # noqa: BLE001
                 _LOG.warning("initial cache warm-up failed", exc_info=True)
@@ -337,8 +477,13 @@ class Repository:
         quota_metric: str,
         limit_name: str,
         location: str,
+        allowed_projects: Iterable[str] | None = None,
     ) -> list[dict]:
         """Daily series for one quota, for the detail drawer."""
+        if allowed_projects is not None and project_id not in set(allowed_projects):
+            raise PermissionError(
+                f"Caller is not authorized to view quota history for project {project_id!r}"
+            )
 
         def produce() -> list[dict]:
             sql = f"""

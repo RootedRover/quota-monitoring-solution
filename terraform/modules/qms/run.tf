@@ -58,9 +58,10 @@ resource "google_cloud_run_v2_job" "collector" {
 # ------------------------------------------------------------ dashboard
 
 resource "google_cloud_run_v2_service" "dashboard" {
-  project  = var.project_id
-  location = var.region
-  name     = "qms-dashboard"
+  project     = var.project_id
+  location    = var.region
+  name        = "qms-dashboard"
+  iap_enabled = var.iap_enabled
 
   deletion_protection = false
 
@@ -110,6 +111,18 @@ resource "google_cloud_run_v2_service" "dashboard" {
       env {
         name  = "QMS_BQ_LOCATION"
         value = var.region
+      }
+      env {
+        name  = "QMS_ORG"
+        value = var.organization_id
+      }
+      env {
+        name  = "QMS_AUTHZ_MODE"
+        value = "enforced"
+      }
+      env {
+        name  = "QMS_IAP_AUDIENCE"
+        value = "/projects/${data.google_project.this.number}/locations/${var.region}/services/qms-dashboard"
       }
 
       # Liveness only. /healthz never touches BigQuery on purpose: conflating
