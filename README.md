@@ -156,18 +156,18 @@ uv run python -m collector.cli \
 
 ## 6. Cost
 
-QMS v6 is designed to run at minimal operational cost by combining scale-to-zero serverless workloads, free BigQuery batch load jobs, in-memory stale-while-revalidate view caching, and Direct Cloud Run IAP (avoiding the fixed ~$18/month cost of an External Application Load Balancer).
+QMS v6 is designed to run at minimal operational cost by combining scale-to-zero serverless workloads, free BigQuery batch load jobs, in-memory stale-while-revalidate view caching, and Direct Cloud Run IAP (avoiding the fixed \~$18/month cost of an External Application Load Balancer).
 
 ### 6.1 Cost Components
 
-* **Cloud Run Job (`qms-collector`)**: `1 vCPU`, `1 GiB` memory, executed once daily (`30 2 * * *`). Billed only for the seconds the job runs (~6 minutes/day for 100 projects).
+* **Cloud Run Job (`qms-collector`)**: `1 vCPU`, `1 GiB` memory, executed once daily (`30 2 * * *`). Billed only for the seconds the job runs (\~6 minutes/day for 100 projects).
 * **Cloud Run Service (`qms-dashboard`)**: `1 vCPU`, `512 MiB` memory with `min_instance_count = 0` (scales to zero when idle). Client-side filtering/sorting and a 5-minute in-memory cache minimize active CPU time.
 * **BigQuery (`quota_monitoring`)**:
   * **Ingestion**: Uses batch load jobs (`load_table_from_json`), which are **$0.00 (free)**.
-  * **Storage**: Partitioned by `usage_date_utc` and clustered by `(project_id, service, quota_metric)` with 400-day retention (~1.4 GB logical storage for 100 projects; partitions older than 90 days automatically drop to Long-Term Storage pricing).
+  * **Storage**: Partitioned by `usage_date_utc` and clustered by `(project_id, service, quota_metric)` with 400-day retention (\~1.4 GB logical storage for 100 projects; partitions older than 90 days automatically drop to Long-Term Storage pricing).
   * **Queries**: Dashboard reads precomputed views cached in memory for 5 minutes rather than issuing per-click queries.
 * **Cloud Monitoring, Cloud Quotas, Cloud Asset & CRM APIs**: Cloud Quotas, Cloud Asset Inventory, and Cloud Resource Manager API calls are free; Cloud Monitoring API reads (`query_range` on GCP `serviceruntime` quota metrics) include 1,000,000 free API read calls/month per billing account ($0.01 per 1,000 calls thereafter).
-* **Direct Cloud Run IAP, Cloud Scheduler & Artifact Registry**: Direct Cloud Run IAP has no hourly load-balancer fee; Cloud Scheduler is $0.10/month for the single daily cron job; Artifact Registry stores one ~180 MB container image (~$0.02/month).
+* **Direct Cloud Run IAP, Cloud Scheduler & Artifact Registry**: Direct Cloud Run IAP has no hourly load-balancer fee; Cloud Scheduler is $0.10/month for the single daily cron job; Artifact Registry stores one \~180 MB container image (\~$0.02/month).
 
 ### 6.2 Estimated Monthly Cost & Scaling by Project Count
 
@@ -175,9 +175,9 @@ Because `QuotaInfo` limit definitions are cached per GCP service (`O(distinct se
 
 | Monitored Projects | Daily Collector Runtime | Cloud Run (`qms-collector` + `qms-dashboard`) | BigQuery (Storage + Cached View Queries) | Monitoring API, Scheduler & Artifact Registry | **Estimated Total Monthly Cost (Gross List Price)** |
 | --- | --- | ---: | ---: | ---: | ---: |
-| **100 Projects** | ~6 min / day | ~$1.65 – $2.30 | ~$0.35 – $3.20 | ~$0.20 – $0.25 | **~$2.20 – $5.75 / month** |
-| **500 Projects** | ~25 min / day | ~$2.80 – $3.60 | ~$1.50 – $6.00 | ~$0.50 – $0.65 | **~$4.80 – $10.25 / month** |
-| **1,000 Projects** | ~45 min / day | ~$4.20 – $5.40 | ~$3.00 – $10.00 | ~$0.90 – $1.10 | **~$8.10 – $16.50 / month** |
+| **100 Projects** | \~6 min / day | \~$1.65 – $2.30 | \~$0.35 – $3.20 | \~$0.20 – $0.25 | **\~$2.20 – $5.75 / month** |
+| **500 Projects** | \~25 min / day | \~$2.80 – $3.60 | \~$1.50 – $6.00 | \~$0.50 – $0.65 | **\~$4.80 – $10.25 / month** |
+| **1,000 Projects** | \~45 min / day | \~$4.20 – $5.40 | \~$3.00 – $10.00 | \~$0.90 – $1.10 | **\~$8.10 – $16.50 / month** |
 
 *(When GCP monthly free tiers for Cloud Run, BigQuery 1 TiB query / 10 GB storage, and Cloud Monitoring 1M API reads are available on the billing account, net cost for a 100-project deployment is typically under **$0.25 / month**.)*
 
