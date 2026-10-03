@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Organization-wide Google Cloud Quota Monitoring Console — 7-day and 30-day peak utilization, movers, hierarchy rollups, and data quality telemetry.">
   <title>{% block title %}Quota Monitoring Console{% endblock %}</title>
+  <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png?v=6">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico?v=6">
+  <link rel="apple-touch-icon" href="/favicon.png?v=6">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -105,15 +108,12 @@
       letter-spacing: -0.01em;
       color: #ffffff;
     }
-    .console-logo-badge {
-      width: 26px;
+    .console-logo-icon {
       height: 26px;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.25);
+      width: auto;
+      display: block;
+      object-fit: contain;
+      flex-shrink: 0;
     }
     .header-divider {
       width: 1px;
@@ -792,11 +792,7 @@
   <header class="console-header">
     <div class="console-header-inner">
       <div class="console-logo">
-        <span class="console-logo-badge" aria-hidden="true">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/>
-          </svg>
-        </span>
+        <img src="/static/logo.png?v=6" alt="" class="console-logo-icon" width="39" height="26">
         <span>Cloud Quota Monitoring</span>
       </div>
 

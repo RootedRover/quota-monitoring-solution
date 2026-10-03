@@ -23,7 +23,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from .authz import (
@@ -39,6 +39,7 @@ from .queries import Repository, clear_cache, severity
 _LOG = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
+STATIC_DIR = BASE_DIR / "static"
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 _repo: Repository | None = None
@@ -125,6 +126,35 @@ def _num(value) -> str:
 templates.env.filters["pct"] = _pct
 templates.env.filters["num"] = _num
 templates.env.globals["severity"] = severity
+
+_STATIC_CACHE_HEADERS = {"Cache-Control": "public, max-age=86400"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon_ico() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "favicon.ico",
+        media_type="image/x-icon",
+        headers=_STATIC_CACHE_HEADERS,
+    )
+
+
+@app.get("/favicon.png", include_in_schema=False)
+def favicon_png() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "favicon.png",
+        media_type="image/png",
+        headers=_STATIC_CACHE_HEADERS,
+    )
+
+
+@app.get("/static/logo.png", include_in_schema=False)
+def static_logo_png() -> FileResponse:
+    return FileResponse(
+        STATIC_DIR / "logo.png",
+        media_type="image/png",
+        headers=_STATIC_CACHE_HEADERS,
+    )
 
 
 @app.get("/livez")

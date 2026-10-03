@@ -524,3 +524,22 @@ def test_authorizer_crm_supplements_empty_200_from_cloud_asset_and_cascades_to_p
         "workload-owner@krishngupt.altostrat.com", targets
     ) == frozenset({"krishngupt-argolis"})
     assert auth.allowed_projects("nobody@krishngupt.altostrat.com", targets) == frozenset()
+
+
+def test_favicon_and_logo_assets_served() -> None:
+    """Verify the extracted transparent logo and favicons exist and are wired into base.html."""
+    from dashboard.app import STATIC_DIR, favicon_ico, favicon_png, static_logo_png
+
+    for asset in ("favicon.ico", "favicon.png", "logo.png"):
+        path = STATIC_DIR / asset
+        assert path.is_file()
+        assert path.stat().st_size > 100
+
+    assert favicon_ico().media_type == "image/x-icon"
+    assert favicon_png().media_type == "image/png"
+    assert static_logo_png().media_type == "image/png"
+
+    base_html = (STATIC_DIR.parent / "templates" / "base.html").read_text()
+    assert 'href="/favicon.png?v=6"' in base_html
+    assert 'href="/favicon.ico?v=6"' in base_html
+    assert 'src="/static/logo.png?v=6"' in base_html
