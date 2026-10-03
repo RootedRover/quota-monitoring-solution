@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars and fill in. The real file is gitignored: it names a
+# specific organisation and specific human principals, which do not belong in a
+# public repository.
+
+project_id      = "my-project"
+organization_id = "123456789012"
+region          = "asia-south1"
+
+image = "asia-south1-docker.pkg.dev/my-project/qms/qms:v6"
+
+# Principals allowed to open the dashboard. Cloud Run IAM only -- the variable
+# validation in the module refuses allUsers / allAuthenticatedUsers, because the
+# dashboard renders organisation-wide quota posture.
+dashboard_invokers = [
+  "group:quota-viewers@example.com",
+]
+
+collection_schedule = "30 2 * * *"
+schedule_time_zone  = "Asia/Kolkata"

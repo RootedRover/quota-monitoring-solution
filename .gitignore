@@ -5,3 +5,20 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .coverage
+
+# Terraform. The provider plugins are hundreds of MB and the state can contain
+# resource detail that does not belong in a public repo. .terraform.lock.hcl is
+# deliberately NOT ignored -- it pins the provider hashes and must be tracked.
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+*.tfplan
+
+# Real variable files name a specific organisation and specific humans.
+*.tfvars
+!*.tfvars.example
+
+
