@@ -8,6 +8,25 @@
 
 ---
 
+## Contents
+
+* [1. Overview](#1-overview)
+  * [Key Capabilities in v6](#key-capabilities-in-v6)
+* [2. Architecture](#2-architecture)
+* [3. Repository Layout](#3-repository-layout)
+* [4. Deployment Guide](#4-deployment-guide)
+  * [4.1 Before You Begin (Key Google Cloud Concepts & Prerequisites)](#41-before-you-begin-key-google-cloud-concepts--prerequisites)
+  * [4.2 Step-by-Step Deployment](#42-step-by-step-deployment)
+  * [4.3 Opening the Dashboard & Granting Access to Teammates](#43-opening-the-dashboard--granting-access-to-teammates)
+  * [4.4 Troubleshooting & Updating](#44-troubleshooting--updating)
+* [5. Local Development & Testing](#5-local-development--testing)
+* [6. Cost](#6-cost)
+  * [6.1 Cost Components](#61-cost-components)
+  * [6.2 Estimated Monthly Cost & Scaling by Project Count](#62-estimated-monthly-cost--scaling-by-project-count)
+* [7. Getting Support & Contributing](#7-getting-support--contributing)
+
+---
+
 ## 1. Overview
 
 Google Cloud enforces [quotas](https://cloud.google.com/docs/quota) on resource usage across projects, folders, and organizations. **Quota Monitoring Solution (QMS v6)** provides an automated, low-cost, organization-wide quota observability platform built on **Cloud Run**, **BigQuery**, the **Cloud Quotas API**, and **Cloud Monitoring PromQL**.
