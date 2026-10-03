@@ -98,14 +98,39 @@ def active_services(bundle: UsageBundle) -> set[tuple[str, str]]:
     return pairs
 
 
+def enrich_placements(
+    projects: list[str],
+    placements: dict[str, Placement],
+    *,
+    billing_project: str,
+) -> dict[str, Placement]:
+    """Attach read-only ``quota_adjuster_enabled`` status to each project's placement."""
+    quotas = CloudQuotasSource(billing_project=billing_project)
+    enriched: dict[str, Placement] = {}
+    for project_id in projects:
+        base = placements.get(
+            project_id,
+            Placement(org_id=None, folder_id=None, project_number=None),
+        )
+        enabled = quotas.get_quota_adjuster_enabled(f"projects/{project_id}")
+        enriched[project_id] = Placement(
+            org_id=base.org_id,
+            folder_id=base.folder_id,
+            project_number=base.project_number,
+            quota_adjuster_enabled=enabled,
+        )
+    return enriched
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     projects, placements = resolve_projects(args)
+    placements = enrich_placements(projects, placements, billing_project=args.billing_project)
     bundle, definitions = gather(
         projects=projects, billing_project=args.billing_project, days=args.days
     )
     rows = build_rollups(bundle, definitions)
     _LOG.info("built %d rows", len(rows))
-    summarise(rows)
+    summarise(rows, placements=placements)
 
     if args.dry_run:
         print("\n-- dry run, nothing written --")
@@ -122,7 +147,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """Print the full derivation of each ratio so it can be checked by hand."""
-    projects, _ = resolve_projects(args)
+    projects, placements = resolve_projects(args)
+    placements = enrich_placements(projects, placements, billing_project=args.billing_project)
     bundle, definitions = gather(
         projects=projects, billing_project=args.billing_project, days=args.days
     )
@@ -148,12 +174,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
     selected = selected[: args.limit]
 
     for row in selected:
+        placement = placements.get(row.key.project_id)
+        adj = placement.quota_adjuster_enabled if placement else None
+        adj_str = "ENABLED" if adj is True else ("DISABLED" if adj is False else "unknown")
         print("=" * 78)
         print(f"{row.key.project_id}  {row.key.quota_metric}")
         print(f"  limit_name      : {row.key.limit_name or '(none found)'}")
         print(f"  location        : {row.key.location}")
         print(f"  quota class     : {row.quota_class.value}")
         print(f"  limit scope     : {row.scope.value}")
+        print(f"  quota adjuster  : {adj_str}")
         print(
             f"  interval        : {row.interval_seconds}s (source: {row.interval_source.value})"
         )
@@ -170,11 +200,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
             print("  -> no ratio published; see flags above")
     print("=" * 78)
     print(f"{len(selected)} shown of {len(latest)} buckets")
-    summarise(rows)
+    summarise(rows, placements=placements)
     return 0
 
 
-def summarise(rows: list[DailyRollup]) -> None:
+def summarise(
+    rows: list[DailyRollup],
+    *,
+    placements: dict[str, Placement] | None = None,
+) -> None:
     flag_counts: Counter[str] = Counter()
     for row in rows:
         for flag in row.flags:
@@ -193,7 +227,12 @@ def summarise(rows: list[DailyRollup]) -> None:
         by_project[row.key.project_id] += 1
     print("  rows per project:")
     for project, count in sorted(by_project.items()):
-        print(f"    {project:<40} {count}")
+        placement = (placements or {}).get(project)
+        adj = placement.quota_adjuster_enabled if placement else None
+        adj_tag = (
+            " [adjuster: ON]" if adj is True else (" [adjuster: OFF]" if adj is False else "")
+        )
+        print(f"    {project:<40} {count}{adj_tag}")
 
 
 def cmd_views(args: argparse.Namespace) -> int:

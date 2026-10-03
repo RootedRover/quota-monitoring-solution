@@ -31,6 +31,8 @@ from ..normalise import classify_quota, infer_scope, parse_refresh_interval
 _LOG = logging.getLogger(__name__)
 
 _BASE = "https://cloudquotas.googleapis.com/v1"
+# QuotaAdjusterSettings lives on v1beta; QuotaInfo lives on v1.
+_BASE_BETA = "https://cloudquotas.googleapis.com/v1beta"
 _PAGE_SIZE = 200
 
 
@@ -60,6 +62,7 @@ class CloudQuotasSource:
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
         self._cache: dict[tuple[str, str], list[QuotaDefinition]] = {}
+        self._adjuster_cache: dict[str, bool | None] = {}
 
     def _token(self) -> str:
         if not self._credentials.valid:
@@ -120,6 +123,31 @@ class CloudQuotasSource:
     def iter_all(self, container: str, services: list[str]) -> Iterator[QuotaDefinition]:
         for service in services:
             yield from self.list_quota_infos(container, service)
+
+    def get_quota_adjuster_enabled(self, container: str) -> bool | None:
+        """Read-only check of QuotaAdjusterSettings for ``container`` (e.g. ``projects/my-proj``).
+
+        Returns ``True`` if ``enablement == "ENABLED"``, ``False`` if
+        ``"DISABLED"``, or ``None`` if unknown / unreachable.
+        """
+        if container in self._adjuster_cache:
+            return self._adjuster_cache[container]
+
+        url = f"{_BASE_BETA}/{container}/locations/global/quotaAdjusterSettings"
+        result: bool | None = None
+        try:
+            payload = self._get(url, {})
+            enablement = str(payload.get("enablement", "")).upper()
+            if enablement == "ENABLED":
+                result = True
+            elif enablement == "DISABLED":
+                result = False
+        except (CloudQuotasError, requests.RequestException) as exc:
+            _LOG.warning("GetQuotaAdjusterSettings failed for %s: %s", container, exc)
+            result = None
+
+        self._adjuster_cache[container] = result
+        return result
 
 
 def _to_definition(raw: dict, service: str) -> QuotaDefinition:

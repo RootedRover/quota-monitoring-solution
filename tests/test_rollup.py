@@ -333,3 +333,111 @@ class TestDataQuality:
 
         assert row.limit_value == 24
         assert row.peak_ratio == pytest.approx(0.5)
+
+    def test_imprecise_limit_is_flagged_but_remains_comparable(self):
+        """Decision 1A: ``isPrecise=False`` adds ``LIMIT_NOT_PRECISE`` as an
+        informational flag for the Data Quality panel, but does NOT suppress
+        the ratio or withhold the row from the main Risk table."""
+        definition = QuotaDefinition(
+            service="svc.googleapis.com",
+            quota_id="ReadsPerMinutePerProject",
+            quota_metric="svc.googleapis.com/reads",
+            quota_class=QuotaClass.RATE,
+            interval_seconds=60,
+            interval_source=IntervalSource.CLOUD_QUOTAS,
+            scope=LimitScope.PROJECT,
+            is_precise=False,
+            values_by_location={"global": 100},
+        )
+        definitions = {(PROJECT, "svc.googleapis.com"): [definition]}
+        bundle = empty_bundle(rate_minute_peaks=[usage("svc.googleapis.com/reads", 25.0)])
+
+        row = build_rollups(bundle, definitions)[0]
+
+        assert DataQualityFlag.LIMIT_NOT_PRECISE in row.flags
+        assert row.comparable is True
+        assert row.peak_ratio == pytest.approx(0.25)
+
+
+class TestQuotaAdjusterSettings:
+    """Decision 2A: read-only QuotaAdjusterSettings collection and schema/view wiring."""
+
+    def _make_source(self, responses: dict[str, dict], monkeypatch):
+        from collector.sources.cloud_quotas import CloudQuotasError, CloudQuotasSource
+
+        monkeypatch.setattr(
+            "google.auth.default",
+            lambda scopes=None: (object(), "proj-billing"),
+        )
+        src = CloudQuotasSource(billing_project="proj-billing")
+        calls: list[str] = []
+
+        def fake_get(url: str, params: dict[str, str]) -> dict:
+            calls.append(url)
+            payload = responses.get(url, {})
+            if "error" in payload:
+                raise CloudQuotasError(payload["error"])
+            return payload
+
+        monkeypatch.setattr(src, "_get", fake_get)
+        return src, calls
+
+    def test_adjuster_enabled_disabled_and_cached(self, monkeypatch):
+        base = "https://cloudquotas.googleapis.com/v1beta"
+        src, calls = self._make_source(
+            {
+                f"{base}/projects/proj-on/locations/global/quotaAdjusterSettings": {
+                    "name": "projects/proj-on/locations/global/quotaAdjusterSettings",
+                    "enablement": "ENABLED",
+                },
+                f"{base}/projects/proj-off/locations/global/quotaAdjusterSettings": {
+                    "name": "projects/proj-off/locations/global/quotaAdjusterSettings",
+                    "enablement": "DISABLED",
+                },
+                f"{base}/projects/proj-err/locations/global/quotaAdjusterSettings": {
+                    "error": "permission denied",
+                },
+            },
+            monkeypatch,
+        )
+
+        assert src.get_quota_adjuster_enabled("projects/proj-on") is True
+        # Second call for the same container hits the cache without another HTTP request.
+        assert src.get_quota_adjuster_enabled("projects/proj-on") is True
+        assert src.get_quota_adjuster_enabled("projects/proj-off") is False
+        assert src.get_quota_adjuster_enabled("projects/proj-err") is None
+        assert len(calls) == 3
+
+    def test_bigquery_row_and_views_include_quota_adjuster(self):
+        from collector.sinks.bigquery import SCHEMA, Placement, _to_json
+        from collector.sinks.views import _definitions
+
+        definitions = {
+            (PROJECT, "svc.googleapis.com"): [
+                allocation_def("CapPerProject", "svc.googleapis.com/c", value=100)
+            ]
+        }
+        bundle = empty_bundle(allocation_peaks=[usage("svc.googleapis.com/c", 40.0)])
+        row = build_rollups(bundle, definitions)[0]
+
+        rec_on = _to_json(
+            row,
+            DAY,
+            Placement(
+                org_id="123",
+                folder_id=None,
+                project_number="456",
+                quota_adjuster_enabled=True,
+            ),
+        )
+        rec_none = _to_json(row, DAY, None)
+
+        assert rec_on["quota_adjuster_enabled"] is True
+        assert rec_none["quota_adjuster_enabled"] is None
+        assert any(
+            f.name == "quota_adjuster_enabled" and f.field_type == "BOOL" for f in SCHEMA
+        )
+
+        view_sql = _definitions("proj.ds.quota_daily")
+        assert "quota_adjuster_enabled" in view_sql["quota_risk"]
+        assert "quota_adjuster_enabled" in view_sql["quota_hierarchy"]

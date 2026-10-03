@@ -232,6 +232,7 @@
                 data-metric="{{ row.quota_metric }}"
                 data-limit="{{ row.limit_name or '' }}"
                 data-location="{{ row.location }}"
+                data-adjuster="{{ 'ENABLED' if row.quota_adjuster_enabled is true else ('DISABLED' if row.quota_adjuster_enabled is false else 'UNKNOWN') }}"
                 data-ratio30="{{ row.peak_ratio_30d if row.peak_ratio_30d is not none else -1 }}"
                 data-ratio7="{{ row.peak_ratio_7d if row.peak_ratio_7d is not none else -1 }}"
                 data-peak7="{{ row.peak_usage_7d if row.peak_usage_7d is not none else -1 }}"
@@ -353,7 +354,7 @@
 <section id="tab-hierarchy" class="tab-panel hidden">
   <div class="filter-toolbar">
     <span style="color: var(--text-secondary);">
-      Organization, Folder, and Project posture rollup — threshold counts and worst 30-day peak per node.
+      Organization, Folder, and Project posture rollup — Quota Adjuster status, threshold counts, and worst 30-day peak per node.
     </span>
   </div>
   <div class="table-card">
@@ -364,6 +365,7 @@
             <th>Organization ID</th>
             <th>Folder ID</th>
             <th>Project</th>
+            <th>Quota Adjuster</th>
             <th class="num-col">Comparable Quotas</th>
             <th class="num-col">Critical (&ge; 90%)</th>
             <th class="num-col">Warning (80–90%)</th>
@@ -376,6 +378,15 @@
               <td class="mono" style="color: var(--text-secondary);">{{ row.org_id or '—' }}</td>
               <td class="mono" style="color: var(--text-secondary);">{{ row.folder_id or '—' }}</td>
               <td class="cell-project mono">{{ row.project_id }}</td>
+              <td>
+                {% if row.quota_adjuster_enabled is true %}
+                  <span class="sev-badge sev-ok" style="min-width: auto;">Enabled</span>
+                {% elif row.quota_adjuster_enabled is false %}
+                  <span class="sev-badge sev-unknown" style="min-width: auto;">Disabled</span>
+                {% else %}
+                  <span style="color: var(--text-muted);">—</span>
+                {% endif %}
+              </td>
               <td class="num-col tabular mono">{{ row.quotas_tracked }}</td>
               <td class="num-col tabular mono" style="{% if row.critical_30d %}color: var(--sev-critical-text); font-weight: 700;{% endif %}">
                 {{ row.critical_30d }}
@@ -754,9 +765,11 @@
       limit_name: tr.dataset.limit,
       location:   tr.dataset.location,
     });
+    const adj = tr.dataset.adjuster;
+    const adjLabel = adj === 'ENABLED' ? ' · Adjuster: ON' : (adj === 'DISABLED' ? ' · Adjuster: OFF' : '');
     document.getElementById('drawer-title').textContent = shortMetric(tr.dataset.metric);
     document.getElementById('drawer-subtitle').textContent =
-      `${tr.dataset.project} · ${shortService(tr.dataset.service)} · ${tr.dataset.limit || 'default'} · ${tr.dataset.location}`;
+      `${tr.dataset.project} · ${shortService(tr.dataset.service)} · ${tr.dataset.limit || 'default'} · ${tr.dataset.location}${adjLabel}`;
     document.getElementById('drawer').classList.add('open');
     document.getElementById('scrim').classList.add('open');
 

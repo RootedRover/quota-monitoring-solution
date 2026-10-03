@@ -63,6 +63,7 @@ SCHEMA = [
     bigquery.SchemaField("peak_ratio", "FLOAT64"),
     bigquery.SchemaField("is_comparable", "BOOL"),
     bigquery.SchemaField("flags", "STRING", mode="REPEATED"),
+    bigquery.SchemaField("quota_adjuster_enabled", "BOOL"),
 ]
 
 
@@ -78,6 +79,7 @@ class Placement:
     org_id: str | None
     folder_id: str | None
     project_number: str | None
+    quota_adjuster_enabled: bool | None = None
 
 
 class BigQuerySink:
@@ -91,7 +93,7 @@ class BigQuerySink:
         self.project_id = project_id
         self.dataset = dataset
         self.location = location
-        self._client = bigquery.Client(project=project_id)
+        self._client = bigquery.Client(project=project_id, location=location)
 
     @property
     def table_ref(self) -> str:
@@ -110,7 +112,22 @@ class BigQuerySink:
             expiration_ms=retention_days * 86_400_000,
         )
         table.clustering_fields = ["project_id", "service", "quota_metric", "limit_name"]
-        self._client.create_table(table, exists_ok=True)
+        created = self._client.create_table(table, exists_ok=True)
+
+        # Schema evolution: create_table(..., exists_ok=True) returns an
+        # existing table untouched, so add any newly introduced NULLABLE
+        # columns (e.g. quota_adjuster_enabled) in place.
+        existing_names = {field.name for field in created.schema}
+        missing = [field for field in SCHEMA if field.name not in existing_names]
+        if missing:
+            created.schema = [*list(created.schema), *missing]
+            self._client.update_table(created, ["schema"])
+            _LOG.info(
+                "added %d new column(s) to %s: %s",
+                len(missing),
+                self.table_ref,
+                ", ".join(f.name for f in missing),
+            )
 
     def write(
         self,
@@ -202,4 +219,5 @@ def _to_json(
         "peak_ratio": row.peak_ratio,
         "is_comparable": row.comparable,
         "flags": [flag.value for flag in row.flags],
+        "quota_adjuster_enabled": placement.quota_adjuster_enabled if placement else None,
     }
