@@ -33,6 +33,7 @@ terraform -chdir=terraform/example init
 
 | Resource | Name |
 |---|---|
+| Host Project APIs (`google_project_service.this`) | `artifactregistry`, `bigquery`, `cloudasset`, `cloudbuild`, `cloudquotas`, `cloudresourcemanager`, `cloudscheduler`, `iam`, `iap`, `logging`, `monitoring`, `run`, `storage` (`.googleapis.com`) |
 | Service accounts | `qms-collector`, `qms-dashboard`, `qms-build`, `qms-scheduler` |
 | BigQuery dataset | `quota_monitoring` (regional, `var.region`) |
 | Artifact Registry | `qms` (Docker) |
@@ -40,6 +41,8 @@ terraform -chdir=terraform/example init
 | Cloud Run job | `qms-collector` |
 | Cloud Run service | `qms-dashboard` |
 | Cloud Scheduler | `qms-daily-collect` |
+
+> **APIs on Monitored Projects:** Each monitored project in the organization only needs `monitoring.googleapis.com` enabled (which is enabled by default on Google Cloud projects) so PromQL can read `serviceruntime.googleapis.com/quota/*` time series. `cloudquotas.googleapis.com` only needs to be enabled on the **Host Project** because `qms-collector` sends `x-goog-user-project: <HOST_PROJECT_ID>` on all Cloud Quotas API requests.
 
 Plus the IAM below. The dataset is created **without**
 `default_partition_expiration_ms`; v5 set it to one day, which silently deleted

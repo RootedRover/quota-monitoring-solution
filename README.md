@@ -144,6 +144,61 @@ gcloud organizations add-iam-policy-binding YOUR_ORG_ID \
 ```
 </details>
 
+#### Required Google Cloud APIs (Host Project vs. Monitored Projects)
+
+QMS interacts with two sets of projects: the single **Host Project (`PROJECT_ID`)** where QMS runs, and the **Monitored Projects** across your Organization whose quotas are queried.
+
+##### 1. APIs in the Host Project (`PROJECT_ID`) — *Automatically Enabled by Terraform in Step 4*
+
+Terraform (`module.qms.google_project_service.this`) automatically enables the 13 required APIs on your Host Project during Step 4:
+
+| Service API | Service Name | Purpose in Host Project |
+| --- | --- | --- |
+| **Cloud Quotas API** | `cloudquotas.googleapis.com` | Queries authoritative `QuotaInfo` limits, dimensions, enforcement intervals, and `QuotaAdjusterSettings` across all projects (using the Host Project via `x-goog-user-project`) |
+| **Cloud Monitoring API** | `monitoring.googleapis.com` | Queries PromQL quota usage time series (`serviceruntime.googleapis.com/quota/*`) |
+| **Cloud Run Admin API** | `run.googleapis.com` | Hosts the `qms-collector` Cloud Run Job and `qms-dashboard` Cloud Run Service |
+| **BigQuery API** | `bigquery.googleapis.com` | Stores the `quota_monitoring` dataset, `quota_daily` table, and 6 analytical views |
+| **Cloud Build API** | `cloudbuild.googleapis.com` | Builds the container image remotely in Step 5 |
+| **Artifact Registry API** | `artifactregistry.googleapis.com` | Stores the QMS Docker container image (`qms` repository) |
+| **Cloud Scheduler API** | `cloudscheduler.googleapis.com` | Triggers the daily `qms-daily-collect` cron schedule |
+| **Cloud Identity-Aware Proxy API** | `iap.googleapis.com` | Secures `qms-dashboard` with Direct Cloud Run IAP authentication |
+| **Cloud Resource Manager API** | `cloudresourcemanager.googleapis.com` | Discovers Organization, Folder, and Project hierarchy and evaluates fallback IAM policies |
+| **Cloud Asset API** | `cloudasset.googleapis.com` | Performs single-RPC organization-wide IAM policy evaluation (`analyzeIamPolicy`) for dashboard users |
+| **Identity and Access Management API** | `iam.googleapis.com` | Creates and manages the 4 dedicated least-privilege QMS service accounts |
+| **Cloud Storage API** | `storage.googleapis.com` | Stages source archives in `${PROJECT_ID}-qms-build-source` for Cloud Build |
+| **Cloud Logging API** | `logging.googleapis.com` | Stores Cloud Build logs, collector execution logs, and `QMS_QUOTA_THRESHOLD_SUMMARY` events |
+
+<details>
+<summary><strong>Want to enable the Host Project APIs manually via <code>gcloud</code>? (Click to expand)</strong></summary>
+
+```bash
+gcloud services enable \
+  artifactregistry.googleapis.com \
+  bigquery.googleapis.com \
+  cloudasset.googleapis.com \
+  cloudbuild.googleapis.com \
+  cloudquotas.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  cloudscheduler.googleapis.com \
+  iam.googleapis.com \
+  iap.googleapis.com \
+  logging.googleapis.com \
+  monitoring.googleapis.com \
+  run.googleapis.com \
+  storage.googleapis.com \
+  --project="$PROJECT_ID"
+```
+</details>
+
+##### 2. APIs in the Monitored Projects (Projects Whose Quotas Are Queried)
+
+You do **not** need to deploy any infrastructure or enable all 13 APIs inside the target projects being monitored across your Organization:
+
+| Service API | Service Name | Required in Each Monitored Project? | Why |
+| --- | --- | --- | --- |
+| **Cloud Monitoring API** | `monitoring.googleapis.com` | **Yes** *(enabled by default on Google Cloud projects)* | Cloud Monitoring PromQL (`projects/{project}/location/global/prometheus/api/v1/query_range`) queries each monitored project's metrics endpoint directly for `serviceruntime.googleapis.com/quota/*` usage time series. If disabled on a project, enable it with `gcloud services enable monitoring.googleapis.com --project=TARGET_PROJECT_ID`. |
+| **Cloud Quotas API** | `cloudquotas.googleapis.com` | **No** *(only required on the Host Project)* | `qms-collector` attaches `x-goog-user-project: <HOST_PROJECT_ID>` to every Cloud Quotas API call, routing API enablement checks and `ReadRequestsPerMinute` quota accounting through the **Host Project** so you do not have to enable `cloudquotas.googleapis.com` across hundreds of existing projects. |
+
 ---
 
 ### 4.2 Step-by-Step Deployment
@@ -344,6 +399,7 @@ QMS enforces a **two-layer security model** so different teams can safely share 
 | **Dashboard loads, but shows `0 projects in your scope (Access Restricted)`** | You have IAP access to open the web app, but your user account does not yet hold `roles/cloudquotas.viewer` on any monitored project, folder, or organization. Grant `roles/cloudquotas.viewer` using one of the commands in [Section 4.3](#43-opening-the-dashboard--granting-access-to-teammates). |
 | **`terraform apply` fails with `Error 403` on `google_organization_iam_member`** | Your account needs `roles/resourcemanager.organizationAdmin` at the Organization level (`$ORG_ID`) so Terraform can bind read-only viewer roles to `qms-collector` and `qms-dashboard`. See the expandable admin commands in [Section 4.1](#41-before-you-begin-key-google-cloud-concepts--prerequisites). |
 | **`gcloud builds submit` fails with `Permission 'storage.objects.get' denied`** | Ensure you completed **Step 4** (`terraform apply -target=...`) so the `${PROJECT_ID}-qms-build-source` bucket and `qms-build` IAM binding exist, and make sure `--gcs-source-staging-dir="gs://${PROJECT_ID}-qms-build-source/source"` is included in your `gcloud builds submit` command. |
+| **A specific monitored project is missing from the dashboard after collection** | 1. Verify `monitoring.googleapis.com` is enabled on that project (`gcloud services enable monitoring.googleapis.com --project=TARGET_PROJECT_ID`).<br>2. Confirm that the project has active API usage emitting `serviceruntime.googleapis.com/quota/*` metrics and that your user account holds `roles/cloudquotas.viewer` on that project (or its parent Folder/Organization). |
 | **How do I update the running app after pulling new code?** | 1. Run `git pull`<br>2. Re-run the `gcloud builds submit` command from **Step 5**<br>3. Run:<br>`gcloud run services update qms-dashboard --project="$PROJECT_ID" --region="$REGION" --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/qms/qms:v6"`<br>`gcloud run jobs update qms-collector --project="$PROJECT_ID" --region="$REGION" --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/qms/qms:v6"` |
 
 ---
