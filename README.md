@@ -13,6 +13,7 @@
 * [1. Overview](#1-overview)
   * [Key Capabilities in v6](#key-capabilities-in-v6)
 * [2. Architecture](#2-architecture)
+  * [2.1 Handling Compute Engine CPU/GPU Family Quotas & Cloud Storage Egress Quotas](#21-handling-compute-engine-cpugpu-family-quotas--cloud-storage-egress-quotas)
 * [3. Repository Layout](#3-repository-layout)
 * [4. Deployment Guide](#4-deployment-guide)
   * [4.1 Before You Begin (Key Google Cloud Concepts & Prerequisites)](#41-before-you-begin-key-google-cloud-concepts--prerequisites)
@@ -59,6 +60,23 @@ One container image (`Dockerfile`) powers two serverless Cloud Run workloads in 
    * **Partition-Pruned Precomputed Views**: All six BigQuery views (`quota_latest`, `quota_peaks`, `quota_risk`, `quota_movers`, `quota_hierarchy`, `quota_quality`) enforce `usage_date_utc` partition pruning (`30–35` days) so refreshes scan only active partitions rather than the full 400-day retention window.
    * **Uncapped Facet Catalog + Bounded Memory (`QMS_RISK_CACHE_LIMIT=15000`)**: Populates the **Project**, **Service**, and **Quota Metric** searchable dropdowns from a complete `(project_id, service, quota_metric)` facet index across all 100–500+ projects while capping DOM rendering at 500 rows and dynamically fetching filtered slices via `GET /api/risk`.
    * **Single-RPC Org IAM Fast Path + SWR Cache**: Evaluates per-user access in a single `organizations/{org_id}:analyzeIamPolicy` (`expandResources=true, expandGroups=true`) call when Cloud Asset Inventory is available, falling back to bounded concurrent Cloud Resource Manager `getIamPolicy` checks only for fresh unindexed grants or custom roles, backed by Stale-While-Revalidate (SWR) caching.
+
+### 2.1 Handling Compute Engine CPU/GPU Family Quotas & Cloud Storage Egress Quotas
+
+Compute Engine CPU/GPU family quotas and Cloud Storage egress bandwidth quotas are the most frequently monitored capacity limits in production, and both suffered from architectural blind spots in legacy QMS versions (v5 and earlier):
+
+1. **Why Legacy QMS Missed or Miscalculated Compute Engine `CPUs per VM Family` & `GPUs per GPU Family`:**
+   * **Generation 1 Family Quotas (`n2_cpus`, `c2_cpus`, `a2_cpus`, `nvidia_l4_gpus`, `nvidia_a100_80gb_gpus`, `gpus_all_regions`):** Emitted as distinct `quota_metric` values on `serviceruntime.googleapis.com/quota/allocation/usage` (`monitored_resource="consumer_quota"`). In legacy v5, a shared mutable accumulator in `ScanProjectQuotasHelper.java` leaked running maximums across metrics in the same project, and MQL `join` queries failed whenever sparse `serviceruntime.googleapis.com/quota/limit` time series were absent.
+   * **Generation 2 Custom-Dimension Family Quotas (`cpus_per_vm_family`, `gpus_per_gpu_family`, `local_ssd_total_storage_per_vm_family`, `tpus_per_tpu_family`):** Newer Compute Engine machine and accelerator families (`C4`, `N4`, `C3D`, `Z3`, `NVIDIA_H100`, `NVIDIA_H200`, `NVIDIA_B200`, etc.) are **not** emitted on `serviceruntime.googleapis.com/quota/allocation/usage` (`consumer_quota`). Instead, Compute Engine emits them on service-specific metrics (`compute.googleapis.com/quota/<suffix>/{usage,limit}`) under **`monitored_resource="compute.googleapis.com/Location"`** with custom dimension labels (`vm_family`, `gpu_family`, `tpu_family`), and returns multi-dimensional limit overrides inside a single `QuotaInfo.dimensionsInfos` list (`dimensions: ["region", "vm_family"]`). Because v5 only queried `consumer_quota` and did not parse custom-dimension `dimensionsInfos`, Generation 2 CPU and GPU family quotas never surfaced.
+   * **How QMS v6 Fixes It:**
+     * Queries both `serviceruntime.googleapis.com/quota/allocation/usage` (`monitored_resource="consumer_quota"`) and the four `compute.googleapis.com/quota/<suffix>/usage` metrics (`monitored_resource="compute.googleapis.com/Location"`), normalizing each active family into a dedicated metric key (`compute.googleapis.com/cpus_per_vm_family/C4`, `compute.googleapis.com/gpus_per_gpu_family/NVIDIA_H100`, etc.).
+     * Expands multi-dimensional `QuotaInfo.dimensionsInfos` from the **Cloud Quotas API** into per-family `QuotaDefinition` entries using deterministic 4-tier specificity precedence: `(location + family)` > `(family default)` > `(location default)` > `(global empty-dimensions default)`.
+     * Generates ready-to-paste `monitored_resource="compute.googleapis.com/Location"` PromQL alert expressions (including the exact `vm_family`, `gpu_family`, or `tpu_family` selector) in the dashboard detail drawer.
+
+2. **Why Legacy QMS Inflated Cloud Storage Egress Bandwidth Quotas (`google_egress_bandwidth`, `internet_egress_bandwidth`):**
+   * Cloud Storage egress bandwidth quotas are **per-second rate quotas** (`refreshInterval: "second"`, `interval_seconds = 1`, measured in bytes/second), whereas Cloud Monitoring samples `serviceruntime.googleapis.com/quota/rate/net_usage` as a **60-second `DELTA`** (`[1m]`).
+   * Legacy v5 divided 60-second (or 24-hour) byte deltas directly by the 1-second bandwidth limit without interval normalization, inflating reported utilization by `60x` to `86,400x`.
+   * **How QMS v6 Fixes It:** Reads `QuotaInfo.refreshInterval` from the Cloud Quotas API and rescales the peak 1-minute delta onto the limit's 1-second enforcement window (`scale_usage_to_interval(..., measured_over_seconds=60, limit_interval_seconds=1)`)—and includes `/ 60` normalization in the 1-click Cloud Console PromQL alert generator—so egress bandwidth utilization is always compared in bytes/second against the bytes/second limit.
 
 ---
 
