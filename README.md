@@ -35,7 +35,8 @@ Google Cloud enforces [quotas](https://cloud.google.com/docs/quota) on resource 
 
 ### Key Capabilities in v6
 
-* **Accurate Quota Utilization Semantics**: Normalizes rate-quota consumption (`serviceruntime.googleapis.com/quota/rate/net_usage`) to the exact enforcement interval (`refreshInterval`: per-minute vs. per-day on `US/Pacific` boundaries) and joins usage to authoritative limits via `QuotaInfo.quotaId ≡ limit_name` from the **Cloud Quotas API** (`cloudquotas.googleapis.com`).
+* **Accurate Quota Utilization Semantics**: Normalizes rate-quota consumption (`serviceruntime.googleapis.com/quota/rate/net_usage`) to the exact enforcement interval (`refreshInterval`: per-second such as Cloud Storage egress bandwidth `storage.googleapis.com/google_egress_bandwidth` and `internet_egress_bandwidth`, per-minute, per-100-seconds, or per-day on `US/Pacific` boundaries) and joins usage to authoritative limits via `QuotaInfo.quotaId ≡ limit_name` from the **Cloud Quotas API** (`cloudquotas.googleapis.com`).
+* **Compute Engine Generation 1 & Generation 2 Custom-Dimension Family Quotas**: Full support for both dedicated family metrics (`n2_cpus`, `c3_cpus`, `nvidia_l4_gpus`, `gpus_all_regions`, etc. on `monitored_resource="consumer_quota"`) and **Generation 2 custom-dimension family quotas** (`compute.googleapis.com/cpus_per_vm_family/<VM_FAMILY>`, `compute.googleapis.com/gpus_per_gpu_family/<GPU_FAMILY>`, `compute.googleapis.com/local_ssd_total_storage_per_vm_family/<VM_FAMILY>`, `compute.googleapis.com/tpus_per_tpu_family/<TPU_FAMILY>` emitted on `monitored_resource="compute.googleapis.com/Location"` with `vm_family` / `gpu_family` / `tpu_family` labels), resolving per-family regional limits using 4-tier `dimensionsInfos` specificity precedence (`location + family` > `family default` > `location default` > `global default`).
 * **Comparability Guardrails**: Automatically detects and withholds non-comparable pairings (such as project-aggregate usage vs. per-user limits `dimensions: ["user"]`) and normalizes unlimited quota sentinels (`9223372036854775807` and `-1`), surfacing full telemetry in a dedicated **Data Quality & Guardrails** tab.
 * **7-Day & 30-Day Peak Tracking**: Stores daily peak and current usage in a partitioned, clustered BigQuery table (`quota_daily`, 400-day retention) backed by six precomputed BigQuery views (`quota_latest`, `quota_peaks`, `quota_risk`, `quota_movers`, `quota_hierarchy`, `quota_quality`).
 * **Self-Hosted Cloud Console UI (`qms-dashboard`)**: Fast, zero-dependency Cloud Console design featuring cascading searchable dropdowns (`Project`, `Service`, `Quota Metric`), instant threshold filters (`All`, `>= 50%`, `>= 80%`, `>= 90%`), a 30-day interactive trend drawer, **7d Movers**, and **Org & Folder Hierarchy** rollups (including read-only **Quota Adjuster** status per project).
@@ -81,7 +82,7 @@ dashboard/            # Self-hosted FastAPI + Jinja2 Cloud Console UI
 terraform/            # Terraform >= 1.5 / google provider ~> 8.0
   modules/qms/        #   Reusable QMS module (Cloud Run Job + Service, BigQuery, Scheduler, IAM)
   example/            #   Example root module
-tests/                # Golden-file and unit test suite (pytest, 108 tests)
+tests/                # Golden-file and unit test suite (pytest, 112 tests)
 ```
 
 ---

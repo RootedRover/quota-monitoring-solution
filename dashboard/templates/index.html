@@ -897,6 +897,26 @@
   let chart = null;
   let currentDrawerPromql = '';
 
+  const CUSTOM_DIM_METRICS = {
+    'compute.googleapis.com/cpus_per_vm_family': 'vm_family',
+    'compute.googleapis.com/gpus_per_gpu_family': 'gpu_family',
+    'compute.googleapis.com/local_ssd_total_storage_per_vm_family': 'vm_family',
+    'compute.googleapis.com/tpus_per_tpu_family': 'tpu_family',
+  };
+
+  function parseCustomDimMetric(metric) {
+    for (const [base, dimLabel] of Object.entries(CUSTOM_DIM_METRICS)) {
+      const prefix = base + '/';
+      if (metric.startsWith(prefix)) {
+        const family = metric.slice(prefix.length).trim().toUpperCase();
+        if (family && !family.includes('/')) {
+          return { base, dimLabel, family, suffix: base.split('/')[1] };
+        }
+      }
+    }
+    return null;
+  }
+
   function buildConsolePromql(tr) {
     const proj = tr.dataset.project || '';
     const metric = tr.dataset.metric || '';
@@ -906,11 +926,17 @@
     const limitVal = parseFloat(tr.dataset.limitval || '-1');
 
     let expr;
-    if (qclass === 'ALLOCATION') {
+    const customDim = parseCustomDimMetric(metric);
+    if (customDim) {
+      expr = `max by (project_id, ${customDim.dimLabel}, location) ({"compute.googleapis.com/quota/${customDim.suffix}/usage", monitored_resource="compute.googleapis.com/Location", project_id="${proj}", ${customDim.dimLabel}="${customDim.family}", location="${loc}"})`;
+    } else if (qclass === 'ALLOCATION') {
       expr = `max by (project_id, quota_metric, location) ({"serviceruntime.googleapis.com/quota/allocation/usage", monitored_resource="consumer_quota", project_id="${proj}", quota_metric="${metric}", location="${loc}"})`;
     } else {
       const win = interval >= 86400 ? '1d' : '1m';
       expr = `sum by (project_id, quota_metric, location) (increase({"serviceruntime.googleapis.com/quota/rate/net_usage", monitored_resource="consumer_quota", project_id="${proj}", quota_metric="${metric}", location="${loc}"}[${win}]))`;
+      if (interval > 0 && interval < 60) {
+        expr = `(${expr} / ${Math.round(60 / interval)})`;
+      }
     }
     if (limitVal > 0 && limitVal < 1e17) {
       return `(${expr} / ${Math.round(limitVal)}) >= 0.80`;

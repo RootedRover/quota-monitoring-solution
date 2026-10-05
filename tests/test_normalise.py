@@ -239,3 +239,32 @@ class TestClassifyLimit:
 )
 def test_plausibility_flags(ratio, expected):
     assert plausibility_flags(ratio) == expected
+
+
+def test_custom_dimension_metric_helpers():
+    from collector.normalise import (
+        format_custom_dimension_metric,
+        format_custom_dimension_quota_id,
+        split_custom_dimension_metric,
+    )
+
+    metric = format_custom_dimension_metric("compute.googleapis.com/cpus_per_vm_family", " c4 ")
+    assert metric == "compute.googleapis.com/cpus_per_vm_family/C4"
+
+    qid = format_custom_dimension_quota_id("CPUS-PER-VM-FAMILY-per-project-region", "c4")
+    assert qid == "CPUS-PER-VM-FAMILY-per-project-region/C4"
+
+    assert split_custom_dimension_metric(metric) == (
+        "compute.googleapis.com/cpus_per_vm_family",
+        "vm_family",
+        "C4",
+    )
+    assert split_custom_dimension_metric(
+        "compute.googleapis.com/gpus_per_gpu_family/NVIDIA_H100"
+    ) == (
+        "compute.googleapis.com/gpus_per_gpu_family",
+        "gpu_family",
+        "NVIDIA_H100",
+    )
+    assert split_custom_dimension_metric("compute.googleapis.com/cpus") is None
+    assert split_custom_dimension_metric("compute.googleapis.com/cpus_per_vm_family") is None

@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 import requests
 
 from .model import DailyRollup, QuotaClass
+from .normalise import split_custom_dimension_metric
 
 _LOG = logging.getLogger("qms.alerts")
 
@@ -164,7 +165,17 @@ def build_console_promql(
     """Build a ready-to-paste PromQL alert query for Google Cloud Monitoring."""
     loc = location or "global"
     qclass = (quota_class or "RATE").upper()
-    if qclass == QuotaClass.ALLOCATION.value:
+    parsed_custom = split_custom_dimension_metric(quota_metric)
+    if parsed_custom is not None:
+        base_metric, dim_label, family = parsed_custom
+        suffix = base_metric.split("/", 1)[1]
+        metric_name = f"compute.googleapis.com/quota/{suffix}/usage"
+        expr = (
+            f"max by (project_id, {dim_label}, location) ("
+            f'{{"{metric_name}", monitored_resource="compute.googleapis.com/Location", '
+            f'project_id="{project_id}", {dim_label}="{family}", location="{loc}"}})'
+        )
+    elif qclass == QuotaClass.ALLOCATION.value:
         metric_name = "serviceruntime.googleapis.com/quota/allocation/usage"
         expr = (
             f"max by (project_id, quota_metric, location) ("
@@ -179,6 +190,10 @@ def build_console_promql(
             f'increase({{"{metric_name}", monitored_resource="consumer_quota", '
             f'project_id="{project_id}", quota_metric="{quota_metric}", location="{loc}"}}[{window}]))'
         )
+        if interval_seconds and 0 < interval_seconds < 60:
+            scale_div = round(60 / interval_seconds, 4)
+            div_str = str(int(scale_div)) if scale_div.is_integer() else str(scale_div)
+            expr = f"({expr} / {div_str})"
 
     if limit_value and float(limit_value) > 0 and float(limit_value) < 1e18:
         cutoff = round(float(limit_value) * threshold, 2)

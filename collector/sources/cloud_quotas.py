@@ -30,7 +30,15 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from ..model import QuotaDefinition
-from ..normalise import classify_quota, infer_scope, parse_refresh_interval
+from ..normalise import (
+    CUSTOM_DIMENSION_LABELS,
+    CUSTOM_DIMENSION_QUOTA_METRICS,
+    classify_quota,
+    format_custom_dimension_metric,
+    format_custom_dimension_quota_id,
+    infer_scope,
+    parse_refresh_interval,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -182,7 +190,7 @@ class CloudQuotasSource:
                     params["pageToken"] = page_token
                 payload = self._get(url, params)
                 for raw in payload.get("quotaInfos", []):
-                    definitions.append(_to_definition(raw, service))
+                    definitions.extend(_to_definitions(raw, service))
                 page_token = payload.get("nextPageToken", "")
                 if not page_token:
                     break
@@ -249,6 +257,76 @@ class CloudQuotasSource:
         return result
 
 
+def _detect_family_dimension(raw: dict) -> str | None:
+    metric = str(raw.get("metric") or "")
+    if metric in CUSTOM_DIMENSION_QUOTA_METRICS:
+        return CUSTOM_DIMENSION_QUOTA_METRICS[metric]
+    dims = raw.get("dimensions") or ()
+    for label in CUSTOM_DIMENSION_LABELS:
+        if label in dims:
+            return label
+    for info in raw.get("dimensionsInfos", []):
+        info_dims = info.get("dimensions") or {}
+        for label in CUSTOM_DIMENSION_LABELS:
+            if label in info_dims:
+                return label
+    return None
+
+
+def _to_definitions(raw: dict, service: str) -> list[QuotaDefinition]:
+    """Convert a raw ``QuotaInfo`` payload into one or more ``QuotaDefinition``s.
+
+    For standard quotas, returns a single-element list ``[_to_definition(raw, service)]``.
+    For Compute Engine custom-dimension family quotas (``vm_family``, ``gpu_family``,
+    ``tpu_family``), returns the base fallback definition plus one specialized
+    ``QuotaDefinition`` per hardware family present in ``dimensionsInfos``.
+    """
+    base = _to_definition(raw, service)
+    family_dim = _detect_family_dimension(raw)
+    if not family_dim:
+        return [base]
+
+    by_family, default_values = _values_by_family_and_location(raw, family_dim)
+    if default_values:
+        base = QuotaDefinition(
+            service=base.service,
+            quota_id=base.quota_id,
+            quota_metric=base.quota_metric,
+            quota_class=base.quota_class,
+            interval_seconds=base.interval_seconds,
+            interval_source=base.interval_source,
+            scope=base.scope,
+            dimensions=base.dimensions,
+            is_precise=base.is_precise,
+            metric_unit=base.metric_unit,
+            display_name=base.display_name,
+            container_type=base.container_type,
+            values_by_location=default_values,
+        )
+
+    results: list[QuotaDefinition] = [base]
+    base_display = base.display_name or base.quota_id
+    for family, family_values in sorted(by_family.items()):
+        results.append(
+            QuotaDefinition(
+                service=base.service,
+                quota_id=format_custom_dimension_quota_id(base.quota_id, family),
+                quota_metric=format_custom_dimension_metric(base.quota_metric, family),
+                quota_class=base.quota_class,
+                interval_seconds=base.interval_seconds,
+                interval_source=base.interval_source,
+                scope=base.scope,
+                dimensions=base.dimensions,
+                is_precise=base.is_precise,
+                metric_unit=base.metric_unit,
+                display_name=f"{base_display} ({family})" if base_display else family,
+                container_type=base.container_type,
+                values_by_location=family_values,
+            )
+        )
+    return results
+
+
 def _to_definition(raw: dict, service: str) -> QuotaDefinition:
     refresh_interval = raw.get("refreshInterval")
     dimensions = tuple(raw.get("dimensions") or ())
@@ -288,6 +366,71 @@ def _to_definition(raw: dict, service: str) -> QuotaDefinition:
         container_type=container_type,
         values_by_location=_values_by_location(raw),
     )
+
+
+def _extract_locations(info: dict, dims: dict) -> list[str]:
+    applicable = info.get("applicableLocations")
+    if applicable:
+        return [str(loc) for loc in applicable if loc]
+    for loc_key in ("region", "zone", "location"):
+        if dims.get(loc_key):
+            return [str(dims[loc_key])]
+    return ["global"]
+
+
+def _values_by_family_and_location(
+    raw: dict, family_dim: str
+) -> tuple[dict[str, dict[str, int | None]], dict[str, int | None]]:
+    """Resolve per-family and generic location limits using 4-tier specificity.
+
+    Specificity precedence (highest to lowest):
+    4: ``(location + family)`` override
+    3: ``(family-only)`` global default across ``applicableLocations``
+    2: ``(location-only)`` regional/zonal default (no family dimension)
+    1: ``(empty dimensions)`` global fallback default
+    """
+    infos = raw.get("dimensionsInfos") or []
+    families: set[str] = set()
+    for info in infos:
+        dims = info.get("dimensions") or {}
+        fam = str(dims.get(family_dim) or "").strip().upper()
+        if fam:
+            families.add(fam)
+
+    default_values: dict[str, int | None] = {}
+    default_ranks: dict[str, int] = {}
+    for info in infos:
+        dims = info.get("dimensions") or {}
+        fam = str(dims.get(family_dim) or "").strip().upper()
+        if fam:
+            continue
+        has_loc = bool(dims.get("region") or dims.get("zone") or dims.get("location"))
+        rank = 2 if has_loc else 1
+        value = _parse_value(info.get("details", {}).get("value"))
+        for loc in _extract_locations(info, dims):
+            if rank > default_ranks.get(loc, 0):
+                default_ranks[loc] = rank
+                default_values[loc] = value
+
+    by_family: dict[str, dict[str, int | None]] = {}
+    for family in sorted(families):
+        loc_values: dict[str, int | None] = dict(default_values)
+        loc_ranks: dict[str, int] = dict(default_ranks)
+        for info in infos:
+            dims = info.get("dimensions") or {}
+            fam = str(dims.get(family_dim) or "").strip().upper()
+            if fam != family:
+                continue
+            has_loc = bool(dims.get("region") or dims.get("zone") or dims.get("location"))
+            rank = 4 if has_loc else 3
+            value = _parse_value(info.get("details", {}).get("value"))
+            for loc in _extract_locations(info, dims):
+                if rank > loc_ranks.get(loc, 0):
+                    loc_ranks[loc] = rank
+                    loc_values[loc] = value
+        by_family[family] = loc_values
+
+    return by_family, default_values
 
 
 def _values_by_location(raw: dict) -> dict[str, int | None]:

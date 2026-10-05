@@ -441,3 +441,199 @@ class TestQuotaAdjusterSettings:
         view_sql = _definitions("proj.ds.quota_daily")
         assert "quota_adjuster_enabled" in view_sql["quota_risk"]
         assert "quota_adjuster_enabled" in view_sql["quota_hierarchy"]
+
+
+class TestCustomDimensionFamilyQuotas:
+    """Compute Engine Generation 2 custom-dimension family quotas
+    (cpus_per_vm_family, gpus_per_gpu_family, local_ssd_total_storage_per_vm_family,
+    tpus_per_tpu_family) and GCS egress per-second rate quotas."""
+
+    def test_four_tier_specificity_and_per_family_rollup(self):
+        from collector.sources.cloud_quotas import _to_definitions
+
+        raw_quota_info = {
+            "quotaId": "CPUS-PER-VM-FAMILY-per-project-region",
+            "metric": "compute.googleapis.com/cpus_per_vm_family",
+            "service": "compute.googleapis.com",
+            "isPrecise": True,
+            "refreshInterval": None,
+            "containerType": "PROJECT",
+            "dimensions": ["region", "vm_family"],
+            "quotaDisplayName": "CPUs per VM family",
+            # Deliberately put generic regional default FIRST to verify that
+            # rank-based specificity beats raw array order.
+            "dimensionsInfos": [
+                {
+                    "dimensions": {"region": "asia-east1"},
+                    "details": {"value": "0"},
+                    "applicableLocations": ["asia-east1"],
+                },
+                {
+                    "dimensions": {"vm_family": "C3D"},
+                    "details": {"value": "8"},
+                    "applicableLocations": ["asia-east1", "us-central1"],
+                },
+                {
+                    "dimensions": {"region": "asia-east1", "vm_family": "C3D"},
+                    "details": {"value": "64"},
+                    "applicableLocations": ["asia-east1"],
+                },
+                {
+                    "dimensions": {"region": "us-central1", "vm_family": "C4"},
+                    "details": {"value": "128"},
+                    "applicableLocations": ["us-central1"],
+                },
+                {
+                    "dimensions": {},
+                    "details": {"value": "0"},
+                    "applicableLocations": ["us-central1", "europe-west1"],
+                },
+            ],
+        }
+
+        defs = _to_definitions(raw_quota_info, "compute.googleapis.com")
+        by_metric = {d.quota_metric: d for d in defs}
+
+        assert "compute.googleapis.com/cpus_per_vm_family/C3D" in by_metric
+        assert "compute.googleapis.com/cpus_per_vm_family/C4" in by_metric
+
+        c3d = by_metric["compute.googleapis.com/cpus_per_vm_family/C3D"]
+        # Rank 4 (region + vm_family) beats Rank 3 (vm_family default) and Rank 2 (region default)
+        assert c3d.value_for("asia-east1") == 64
+        # Rank 3 (vm_family default = 8) beats Rank 1 (empty dims default = 0)
+        assert c3d.value_for("us-central1") == 8
+
+        c4 = by_metric["compute.googleapis.com/cpus_per_vm_family/C4"]
+        assert c4.value_for("us-central1") == 128
+        # In asia-east1, C4 has no family entry so it inherits Rank 2 (region default = 0)
+        assert c4.value_for("asia-east1") == 0
+
+        definitions = {(PROJECT, "compute.googleapis.com"): defs}
+        bundle = empty_bundle(
+            allocation_peaks=[
+                usage(
+                    "compute.googleapis.com/cpus_per_vm_family/C3D",
+                    32.0,
+                    service="compute.googleapis.com",
+                    location="asia-east1",
+                ),
+                usage(
+                    "compute.googleapis.com/cpus_per_vm_family/C4",
+                    96.0,
+                    service="compute.googleapis.com",
+                    location="us-central1",
+                ),
+                # N4 is not explicitly in dimensionsInfos -> falls back to base definition
+                usage(
+                    "compute.googleapis.com/cpus_per_vm_family/N4",
+                    4.0,
+                    service="compute.googleapis.com",
+                    location="europe-west1",
+                ),
+            ]
+        )
+
+        rows = {
+            (r.key.quota_metric, r.key.location): r for r in build_rollups(bundle, definitions)
+        }
+
+        c3d_row = rows[("compute.googleapis.com/cpus_per_vm_family/C3D", "asia-east1")]
+        assert c3d_row.key.limit_name == "CPUS-PER-VM-FAMILY-per-project-region/C3D"
+        assert c3d_row.limit_value == 64
+        assert c3d_row.peak_ratio == pytest.approx(0.5)
+
+        c4_row = rows[("compute.googleapis.com/cpus_per_vm_family/C4", "us-central1")]
+        assert c4_row.key.limit_name == "CPUS-PER-VM-FAMILY-per-project-region/C4"
+        assert c4_row.limit_value == 128
+        assert c4_row.peak_ratio == pytest.approx(0.75)
+
+        n4_row = rows[("compute.googleapis.com/cpus_per_vm_family/N4", "europe-west1")]
+        assert n4_row.key.limit_name == "CPUS-PER-VM-FAMILY-per-project-region/N4"
+        assert n4_row.limit_value == 0
+        assert DataQualityFlag.LIMIT_NON_POSITIVE in n4_row.flags
+
+    def test_monitoring_source_parses_custom_dimension_and_isolates_failures(self, monkeypatch):
+        from collector.sources.monitoring import (
+            Q_ALLOCATION_PEAK,
+            Q_COMPUTE_CUSTOM_ALLOCATION_PEAK,
+            MonitoringSource,
+            RangePoint,
+        )
+
+        monkeypatch.setattr(
+            "collector.sources.monitoring.google.auth.default",
+            lambda **_kw: (object(), PROJECT),
+        )
+        mon = MonitoringSource(PROJECT)
+
+        def fake_query_range(query: str, *, start: dt.datetime, end: dt.datetime):
+            del start, end
+            if query == Q_ALLOCATION_PEAK:
+                yield (
+                    {
+                        "project_id": PROJECT,
+                        "service": "compute.googleapis.com",
+                        "quota_metric": "compute.googleapis.com/cpus",
+                        "location": "us-central1",
+                    },
+                    [RangePoint(at=DAY, value=16.0)],
+                )
+            elif query == Q_COMPUTE_CUSTOM_ALLOCATION_PEAK:
+                yield (
+                    {
+                        "project_id": PROJECT,
+                        "location": "us-central1",
+                        "limit_name": "GPUS-PER-GPU-FAMILY-per-project-region",
+                        "gpu_family": "NVIDIA_H100",
+                    },
+                    [RangePoint(at=DAY, value=8.0)],
+                )
+
+        monkeypatch.setattr(mon, "query_range_daily", fake_query_range)
+        samples = mon.allocation_daily_peaks(start=DAY, end=DAY)
+        by_metric = {s.key.quota_metric: s for s in samples}
+        assert by_metric["compute.googleapis.com/cpus"].value == 16.0
+        assert by_metric["compute.googleapis.com/gpus_per_gpu_family/NVIDIA_H100"].value == 8.0
+
+        # Now verify safeguard: if custom_dimension_daily_peaks raises, standard
+        # consumer_quota samples are still returned intact.
+        def broken_custom(**_kw):
+            raise RuntimeError("simulated Location query failure")
+
+        monkeypatch.setattr(mon, "custom_dimension_daily_peaks", broken_custom)
+        safe_samples = mon.allocation_daily_peaks(start=DAY, end=DAY)
+        assert len(safe_samples) == 1
+        assert safe_samples[0].key.quota_metric == "compute.googleapis.com/cpus"
+
+    def test_gcs_egress_per_second_rate_quota_rescaled_accurately(self):
+        """GCS egress bandwidth quotas (refreshInterval='second', interval=1)
+        must rescale 60-second peak usage onto a 1-second window so ratios are
+        never inflated 60x."""
+        definitions = {
+            (PROJECT, "storage.googleapis.com"): [
+                rate_def(
+                    "GoogleEgressBandwidthPerSecondPerRegion",
+                    "storage.googleapis.com/google_egress_bandwidth",
+                    value=25_000_000_000,  # 25 GB/s
+                    interval=1,
+                    service="storage.googleapis.com",
+                    scope=LimitScope.REGION,
+                )
+            ]
+        }
+        # 600 GB transferred in the peak minute == 10 GB/s average over that minute (40% of 25 GB/s)
+        bundle = empty_bundle(
+            rate_minute_peaks=[
+                usage(
+                    "storage.googleapis.com/google_egress_bandwidth",
+                    600_000_000_000.0,
+                    service="storage.googleapis.com",
+                    location="us-central1",
+                )
+            ]
+        )
+
+        row = build_rollups(bundle, definitions)[0]
+        assert row.daily_peak_usage == pytest.approx(10_000_000_000.0)
+        assert row.peak_ratio == pytest.approx(0.40)
+        assert DataQualityFlag.RATIO_IMPLAUSIBLE not in row.flags

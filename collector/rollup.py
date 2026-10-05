@@ -33,10 +33,13 @@ from .model import (
 )
 from .normalise import (
     classify_limit,
+    format_custom_dimension_metric,
+    format_custom_dimension_quota_id,
     interval_flags,
     is_unlimited,
     plausibility_flags,
     scale_usage_to_interval,
+    split_custom_dimension_metric,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -151,6 +154,27 @@ def _index_definitions(
     return index
 
 
+def _specialize_custom_dimension_definition(
+    base: QuotaDefinition, family: str
+) -> QuotaDefinition:
+    base_display = base.display_name or base.quota_id
+    return QuotaDefinition(
+        service=base.service,
+        quota_id=format_custom_dimension_quota_id(base.quota_id, family),
+        quota_metric=format_custom_dimension_metric(base.quota_metric, family),
+        quota_class=base.quota_class,
+        interval_seconds=base.interval_seconds,
+        interval_source=base.interval_source,
+        scope=base.scope,
+        dimensions=base.dimensions,
+        is_precise=base.is_precise,
+        metric_unit=base.metric_unit,
+        display_name=f"{base_display} ({family})" if base_display else family,
+        container_type=base.container_type,
+        values_by_location=base.values_by_location,
+    )
+
+
 def _accumulate(
     samples: list[UsageSample],
     index: dict[tuple[str, str, str], list[QuotaDefinition]],
@@ -165,6 +189,16 @@ def _accumulate(
         candidates = index.get(
             (usage_key.project_id, usage_key.service, usage_key.quota_metric), []
         )
+        if not candidates:
+            parsed_custom = split_custom_dimension_metric(usage_key.quota_metric)
+            if parsed_custom is not None:
+                base_metric, _dim_label, family = parsed_custom
+                base_candidates = index.get(
+                    (usage_key.project_id, usage_key.service, base_metric), []
+                )
+                candidates = [
+                    _specialize_custom_dimension_definition(d, family) for d in base_candidates
+                ]
         matched = [d for d in candidates if accepts(d)]
 
         if not matched:

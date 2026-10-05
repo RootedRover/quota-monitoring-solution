@@ -179,6 +179,32 @@ def test_build_console_promql_for_allocation_and_rate_quotas() -> None:
     assert "[1m]" in rate_q
     assert "/ 600) >= 0.80" in rate_q
 
+    custom_q = build_console_promql(
+        project_id="krishngupt-argolis",
+        quota_metric="compute.googleapis.com/cpus_per_vm_family/C4",
+        location="us-central1",
+        quota_class="ALLOCATION",
+        interval_seconds=None,
+        limit_value=128,
+        threshold=0.80,
+    )
+    assert "compute.googleapis.com/quota/cpus_per_vm_family/usage" in custom_q
+    assert 'monitored_resource="compute.googleapis.com/Location"' in custom_q
+    assert 'vm_family="C4"' in custom_q
+    assert "/ 128) >= 0.80" in custom_q
+
+    egress_q = build_console_promql(
+        project_id="krishngupt-argolis",
+        quota_metric="storage.googleapis.com/google_egress_bandwidth",
+        location="us-central1",
+        quota_class="RATE",
+        interval_seconds=1,
+        limit_value=25000000000,
+        threshold=0.80,
+    )
+    assert "/ 60)" in egress_q
+    assert "/ 25000000000) >= 0.80" in egress_q
+
 
 def test_dashboard_api_alerts_and_header_bell_scoped_per_user(
     monkeypatch: pytest.MonkeyPatch,

@@ -31,18 +31,42 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from ..model import UsageKey, UsageSample
+from ..normalise import (
+    CUSTOM_DIMENSION_LABELS,
+    CUSTOM_DIMENSION_QUOTA_METRICS,
+    format_custom_dimension_metric,
+)
 
 _LOG = logging.getLogger(__name__)
 
 _BASE = "https://monitoring.googleapis.com/v1"
 _CONSUMER = 'monitored_resource="consumer_quota"'
+_COMPUTE_LOCATION = 'monitored_resource="compute.googleapis.com/Location"'
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 SERVICERUNTIME = "serviceruntime.googleapis.com"
+COMPUTE_SERVICE = "compute.googleapis.com"
+
+# Map Compute Engine custom-dimension limit_name labels back to their Cloud Quotas metric.
+_CUSTOM_LIMIT_NAME_TO_METRIC: dict[str, str] = {
+    "CPUS-PER-VM-FAMILY-per-project-region": "compute.googleapis.com/cpus_per_vm_family",
+    "GPUS-PER-GPU-FAMILY-per-project-region": "compute.googleapis.com/gpus_per_gpu_family",
+    "LOCAL-SSD-TOTAL-GB-PER-VM-FAMILY-per-project-region": (
+        "compute.googleapis.com/local_ssd_total_storage_per_vm_family"
+    ),
+    "TPUS-PER-TPU-FAMILY-per-project-zone": "compute.googleapis.com/tpus_per_tpu_family",
+}
 
 # Daily peak of the *level* held by an allocation quota.
 Q_ALLOCATION_PEAK = (
     f'max_over_time({{__name__="{SERVICERUNTIME}/quota/allocation/usage",{_CONSUMER}}}[1d])'
+)
+
+# Compute Engine SuperQuota custom-dimension family metrics are emitted on
+# monitored_resource="compute.googleapis.com/Location" rather than consumer_quota.
+Q_COMPUTE_CUSTOM_ALLOCATION_PEAK = " or ".join(
+    f'max_over_time({{__name__="{COMPUTE_SERVICE}/quota/{metric.split("/", 1)[1]}/usage",{_COMPUTE_LOCATION}}}[1d])'
+    for metric in CUSTOM_DIMENSION_QUOTA_METRICS
 )
 
 # Total rate-quota consumption within each day. This is the numerator for
@@ -210,12 +234,53 @@ class MonitoringSource:
     def allocation_daily_peaks(
         self, *, start: dt.datetime, end: dt.datetime
     ) -> list[UsageSample]:
-        return list(
+        samples = list(
             self._as_samples(
                 self.query_range_daily(Q_ALLOCATION_PEAK, start=start, end=end),
                 window_seconds=None,
             )
         )
+        try:
+            samples.extend(self.custom_dimension_daily_peaks(start=start, end=end))
+        except (
+            PromQLError,
+            requests.RequestException,
+            RuntimeError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ) as exc:
+            _LOG.warning(
+                "custom-dimension allocation query failed for %s (continuing with consumer_quota): %s",
+                self.project_id,
+                exc,
+            )
+        return samples
+
+    def custom_dimension_daily_peaks(
+        self, *, start: dt.datetime, end: dt.datetime
+    ) -> list[UsageSample]:
+        """Read Compute Engine custom-dimension family allocation usage peaks."""
+        samples: list[UsageSample] = []
+        for labels, points in self.query_range_daily(
+            Q_COMPUTE_CUSTOM_ALLOCATION_PEAK, start=start, end=end
+        ):
+            key = _custom_dimension_usage_key(labels, fallback_project=self.project_id)
+            if key is None:
+                _LOG.warning(
+                    "skipping custom-dimension series with unusable labels: %s", labels
+                )
+                continue
+            for point in points:
+                samples.append(
+                    UsageSample(
+                        key=key,
+                        observed_at=point.at,
+                        value=point.value,
+                        window_seconds=None,
+                    )
+                )
+        return samples
 
     def rate_daily_totals(self, *, start: dt.datetime, end: dt.datetime) -> list[UsageSample]:
         return list(
@@ -281,6 +346,52 @@ def _usage_key(labels: dict[str, str], *, fallback_project: str) -> UsageKey | N
         project_id=labels.get("project_id") or fallback_project,
         service=service,
         quota_metric=quota_metric,
+        location=labels.get("location") or "global",
+    )
+
+
+def _custom_dimension_usage_key(
+    labels: dict[str, str], *, fallback_project: str
+) -> UsageKey | None:
+    limit_name = labels.get("limit_name", "")
+    base_metric = _CUSTOM_LIMIT_NAME_TO_METRIC.get(limit_name)
+    if not base_metric:
+        raw_metric = labels.get("quota_metric", "")
+        if raw_metric in CUSTOM_DIMENSION_QUOTA_METRICS:
+            base_metric = raw_metric
+        elif limit_name.startswith("CPUS-PER-VM-FAMILY"):
+            base_metric = "compute.googleapis.com/cpus_per_vm_family"
+        elif limit_name.startswith("GPUS-PER-GPU-FAMILY"):
+            base_metric = "compute.googleapis.com/gpus_per_gpu_family"
+        elif limit_name.startswith("LOCAL-SSD-TOTAL-GB-PER-VM-FAMILY"):
+            base_metric = "compute.googleapis.com/local_ssd_total_storage_per_vm_family"
+        elif limit_name.startswith("TPUS-PER-TPU-FAMILY"):
+            base_metric = "compute.googleapis.com/tpus_per_tpu_family"
+        elif labels.get("gpu_family"):
+            base_metric = "compute.googleapis.com/gpus_per_gpu_family"
+        elif labels.get("tpu_family"):
+            base_metric = "compute.googleapis.com/tpus_per_tpu_family"
+        elif labels.get("vm_family"):
+            base_metric = "compute.googleapis.com/cpus_per_vm_family"
+
+    if not base_metric:
+        return None
+
+    dim_label = CUSTOM_DIMENSION_QUOTA_METRICS.get(base_metric)
+    family = (labels.get(dim_label) if dim_label else None) or ""
+    if not family:
+        for candidate in CUSTOM_DIMENSION_LABELS:
+            if labels.get(candidate):
+                family = labels[candidate]
+                break
+    family = family.strip().upper()
+    if not family:
+        return None
+
+    return UsageKey(
+        project_id=labels.get("project_id") or fallback_project,
+        service=COMPUTE_SERVICE,
+        quota_metric=format_custom_dimension_metric(base_metric, family),
         location=labels.get("location") or "global",
     )
 

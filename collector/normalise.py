@@ -266,3 +266,51 @@ def plausibility_flags(ratio: float | None) -> list[DataQualityFlag]:
     if ratio is not None and ratio > PLAUSIBILITY_CEILING:
         return [DataQualityFlag.RATIO_IMPLAUSIBLE]
     return []
+
+
+# Compute Engine SuperQuota custom-dimension family metrics.
+# Unlike standard serviceruntime.googleapis.com/quota/allocation/usage metrics on
+# monitored_resource="consumer_quota", Compute Engine emits these on
+# compute.googleapis.com/quota/<suffix>/{usage,limit} with
+# monitored_resource="compute.googleapis.com/Location" and a family dimension
+# label (vm_family, gpu_family, or tpu_family).
+CUSTOM_DIMENSION_QUOTA_METRICS: dict[str, str] = {
+    "compute.googleapis.com/cpus_per_vm_family": "vm_family",
+    "compute.googleapis.com/gpus_per_gpu_family": "gpu_family",
+    "compute.googleapis.com/local_ssd_total_storage_per_vm_family": "vm_family",
+    "compute.googleapis.com/tpus_per_tpu_family": "tpu_family",
+}
+
+CUSTOM_DIMENSION_LABELS: tuple[str, ...] = ("vm_family", "gpu_family", "tpu_family")
+
+
+def format_custom_dimension_metric(base_metric: str, family_value: str) -> str:
+    """Append the normalized hardware family dimension to a custom-dimension metric."""
+    clean_family = (family_value or "").strip().upper()
+    if not clean_family:
+        return base_metric
+    return f"{base_metric}/{clean_family}"
+
+
+def format_custom_dimension_quota_id(base_quota_id: str, family_value: str) -> str:
+    """Append the normalized hardware family dimension to a Cloud Quotas quotaId."""
+    clean_family = (family_value or "").strip().upper()
+    if not clean_family or not base_quota_id:
+        return base_quota_id
+    return f"{base_quota_id}/{clean_family}"
+
+
+def split_custom_dimension_metric(quota_metric: str) -> tuple[str, str, str] | None:
+    """If ``quota_metric`` is a custom-dimension family metric (e.g.
+    ``compute.googleapis.com/cpus_per_vm_family/C4``), return
+    ``(base_metric, dimension_label, family_value)``. Otherwise return ``None``.
+    """
+    if not quota_metric:
+        return None
+    for base_metric, dim_label in CUSTOM_DIMENSION_QUOTA_METRICS.items():
+        prefix = f"{base_metric}/"
+        if quota_metric.startswith(prefix):
+            family = quota_metric[len(prefix) :].strip().upper()
+            if family and "/" not in family:
+                return base_metric, dim_label, family
+    return None
